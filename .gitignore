@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# --- Android / Gradle (moonreader-tts) ---
+moonreader-tts/.gradle/
+moonreader-tts/.kotlin/
+moonreader-tts/build/
+moonreader-tts/app/build/
+moonreader-tts/local.properties
+moonreader-tts/captures/
+moonreader-tts/.idea/
+*.iml
+
+# --- Python (tts-server, tts-samples) ---
+__pycache__/
+*.py[cod]
+tts-server/.venv-local/
+tts-server/python-runtime/
+tts-server/cache/
+tts-server/server.log
+tts-samples/.venv/
