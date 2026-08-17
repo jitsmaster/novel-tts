@@ -26,11 +26,15 @@ server tier, and the server automatically falls back to the local Kokoro model �
   `uv venv --python ./python-runtime/bin/python3.12 .venv-local`
   `uv pip install --python .venv-local/bin/python pip edge-tts kokoro soundfile "misaki[zh]" fastapi uvicorn`
 - Manual start: `./tts-server/start_server.sh`  (uvicorn, 0.0.0.0:8321)
-- **Auto-start (launchd)**: `com.dsh.noveltts` LaunchAgent is installed at
-  `~/Library/LaunchAgents/com.dsh.noveltts.plist` (copy kept in `tts-server/`).
-  - `RunAtLoad` = starts at login; `KeepAlive` = auto-restarts on crash.
-  - Reload after editing: `launchctl bootout gui/$(id -u)/com.dsh.noveltts; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dsh.noveltts.plist`
+- **Auto-start (launchd)**: `com.dsh.noveltts` LaunchDaemon runs the server at
+  **system boot, before any login** (`/Library/LaunchDaemons/com.dsh.noveltts.plist`;
+  source kept in `tts-server/`, runs as user `satechi`).
+  - `RunAtLoad` = starts at boot; `KeepAlive` = auto-restarts on crash.
+  - Install / re-install (needs admin): `sudo ./tts-server/install_daemon.sh`
+  - Reload after editing: `sudo launchctl bootout system/com.dsh.noveltts; sudo launchctl bootstrap system /Library/LaunchDaemons/com.dsh.noveltts.plist`
   - Sets `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` (models are cached; no network at boot).
+  - Caveat: the server lives on the external volume `/Volumes/Satechi 1` — if that
+    drive is not mounted when boot fires, launchd keeps retrying (KeepAlive) until it appears.
 - Endpoints: `GET /tts?text=…&voice=…&rate=…&pitch=…` → audio/mpeg (Edge) or audio/wav (Kokoro)
   `GET /health`, `GET /voices`
 - Per-sentence disk cache in `tts-server/cache/`

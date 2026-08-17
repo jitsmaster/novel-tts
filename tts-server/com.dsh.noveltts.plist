@@ -3,6 +3,8 @@
 <plist version="1.0">
 <dict>
     <key>Label</key><string>com.dsh.noveltts</string>
+    <key>UserName</key><string>satechi</string>
+    <key>GroupName</key><string>staff</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Volumes/Satechi 1/dev/novel-tts/tts-server/.venv-local/bin/python</string>
@@ -23,7 +25,7 @@
     <string>/Volumes/Satechi 1/dev/novel-tts/tts-server</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/tmp/com.dsh.noveltts.out.log</string>
-    <key>StandardErrorPath</key><string>/tmp/com.dsh.noveltts.err.log</string>
+    <key>StandardOutPath</key><string>/Library/Logs/com.dsh.noveltts.out.log</string>
+    <key>StandardErrorPath</key><string>/Library/Logs/com.dsh.noveltts.err.log</string>
 </dict>
 </plist>
