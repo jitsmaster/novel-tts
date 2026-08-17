@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Warm "reading lamp" palette: deep ink-blue primary, warm amber accent -->
+    <color name="brand_primary">#3D5A80</color>
+    <color name="brand_primary_dark">#98C1D9</color>
+    <color name="brand_secondary">#EE6C4D</color>
+    <color name="brand_secondary_dark">#FFB4A8</color>
+    <color name="brand_tertiary">#6D6875</color>
+    <color name="brand_tertiary_dark">#E8D5F5</color>
+    <color name="brand_surface_light">#FFF8F0</color>
+    <color name="brand_surface_dark">#1C1B22</color>
+
+    <!-- App icon colors -->
+    <color name="icon_bg">#3D5A80</color>
+    <color name="icon_fg">#FFFFFF</color>
+    <color name="icon_accent">#EE6C4D</color>
+
+    <!-- Splash -->
+    <color name="splash_bg">#3D5A80</color>
+    <color name="splash_fg">#FFFFFF</color>
+</resources>

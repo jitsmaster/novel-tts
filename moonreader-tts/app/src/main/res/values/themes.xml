@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme (light) -->
+    <style name="Theme.NovelTTS" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">@color/brand_primary</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/brand_secondary</item>
+        <item name="colorTertiary">@color/brand_tertiary</item>
+        <item name="android:colorBackground">@color/brand_surface_light</item>
+        <item name="colorSurface">@color/brand_surface_light</item>
+        <item name="android:statusBarColor">@color/brand_primary</item>
+        <item name="android:navigationBarColor">@color/brand_surface_light</item>
+    </style>
+
+    <!-- Splash theme (API 31+ uses the platform splash; we also set a pre-31 background) -->
+    <style name="Theme.NovelTTS.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.NovelTTS</item>
+    </style>
+
+    <!-- The TTS engine settings activity is launched by Android with no explicit
+         theme requirement; fall back to a Material light so it looks native. -->
+    <style name="Theme.NovelTTS.Engine" parent="Theme.Material3.Light.NoActionBar">
+        <item name="colorPrimary">@color/brand_primary</item>
+        <item name="android:colorBackground">@color/brand_surface_light</item>
+    </style>
+</resources>
