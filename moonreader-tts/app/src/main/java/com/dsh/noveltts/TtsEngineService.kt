@@ -18,9 +18,8 @@ import android.speech.tts.Voice
 import android.util.Log
 import android.view.KeyEvent
 import java.util.Locale
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Android TTS engine that Moon Reader selects (modern String-based API).
@@ -80,8 +79,9 @@ class TtsEngineService : TextToSpeechService() {
     }
 
     private lateinit var cache: SentenceCache
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val cancelled = AtomicBoolean(false)
+    /** Bumped on every stop; in-flight/queued utterances with an older value abort. */
+    private val generation = AtomicLong(0)
     private val pausedByUser = AtomicBoolean(false)
     private val pausedByFocus = AtomicBoolean(false)
     private val skipCurrent = AtomicBoolean(false)
@@ -139,7 +139,6 @@ class TtsEngineService : TextToSpeechService() {
         goIdle()
         try { mediaSession?.release() } catch (_: Exception) {}
         mediaSession = null
-        executor.shutdownNow()
         super.onDestroy()
     }
 
@@ -262,6 +261,7 @@ class TtsEngineService : TextToSpeechService() {
 
     private fun stopAll() {
         Log.i(TAG, "TTS stop all")
+        generation.incrementAndGet()
         cancelled.set(true)
         pausedByUser.set(false)
         pausedByFocus.set(false)
@@ -310,21 +310,46 @@ class TtsEngineService : TextToSpeechService() {
         val ratePct = "${request.speechRate - 100}%"
         val pitchHz = "${request.pitch - 100}Hz"
 
+        // A fresh utterance means the user wants audio now: clear any pause-hold
+        // left over from a previous pause/stop cycle (a stuck hold would
+        // otherwise block playback forever and make the engine appear dead),
+        // and capture the current generation so a stop that fired earlier also
+        // kills this task.
+        pausedByUser.set(false)
+        pausedByFocus.set(false)
         cancelled.set(false)
         skipCurrent.set(false)
+        val gen = generation.get()
         // New reading activity: stay "active" and stop the idle timer.
         mainHandler.removeCallbacks(idleRunnable)
         mediaSession?.isActive = true
         ensureAudioFocus()
 
-        executor.execute {
-            try {
-                synthesizeAndPlay(text, voice, ratePct, pitchHz, callback)
-            } catch (e: Exception) {
-                Log.e(TAG, "synthesis failed", e)
-                try { callback.error() } catch (_: Exception) {}
-            }
+        // IMPORTANT: the framework requires this method to BLOCK until the
+        // utterance is fully synthesized and played (or aborted). See
+        // TextToSpeechService.playImpl(): immediately after onSynthesizeText
+        // returns it auto-completes the item if start() was called but done()
+        // was not — that would end the item mid-playback and make stop() unable
+        // to interrupt it (the "won't stop" bug). The framework serializes
+        // utterances on its own single synthesis thread, so no executor here.
+        try {
+            synthesizeAndPlay(text, voice, ratePct, pitchHz, callback, gen)
+        } catch (e: Exception) {
+            Log.e(TAG, "synthesis failed", e)
+            try { callback.error() } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Returns true if a stop happened since [gen] was captured. The caller must
+     * then return WITHOUT calling anything on [callback]: the framework's stop
+     * path already notified the client, and error() here would make clients
+     * like Moon Reader retry the aborted sentence (reading continues).
+     */
+    private fun abortIfStale(gen: Long, callback: SynthesisCallback): Boolean {
+        if (gen == generation.get()) return false
+        Log.i(TAG, "utterance stale (stop since gen $gen); aborting silently")
+        return true
     }
 
     private fun synthesizeAndPlay(
@@ -332,13 +357,19 @@ class TtsEngineService : TextToSpeechService() {
         voice: String,
         ratePct: String,
         pitchHz: String,
-        callback: SynthesisCallback
+        callback: SynthesisCallback,
+        gen: Long
     ) {
         val key = SentenceCache.key(voice, ratePct, pitchHz, text)
+
+        // If a stop fired between onSynthesizeText and this point (or while a
+        // previous utterance was still synthesizing), abort before any work.
+        if (abortIfStale(gen, callback)) return
 
         // 1) cache
         var audio: ByteArray? = cache.get(key)
         var source = "cache"
+        if (abortIfStale(gen, callback)) return
         if (audio == null && !forceServerOnly) {
             // 2) Edge TTS direct
             try {
@@ -351,6 +382,7 @@ class TtsEngineService : TextToSpeechService() {
             Log.w(TAG, "forceServerOnly=true; skipping Edge")
         }
         if (audio == null) {
+            if (abortIfStale(gen, callback)) return
             // 3) server fallback (server cascades Edge -> Kokoro locally)
             try {
                 val (body, _) = ServerTtsClient.synthesize(text, voice, ratePct, pitchHz)
@@ -365,8 +397,11 @@ class TtsEngineService : TextToSpeechService() {
         if (audio != null) {
             cache.put(key, audio)
         }
-        if (cancelled.get()) {
-            try { callback.error() } catch (_: Exception) {}
+        if (gen != generation.get() || cancelled.get()) {
+            // Stop arrived while fetching: return silently. The framework's stop
+            // path already notified the client; error() would make clients like
+            // Moon Reader retry the aborted sentence.
+            Log.i(TAG, "aborted before playback (stop during fetch)")
             return
         }
 
@@ -384,8 +419,8 @@ class TtsEngineService : TextToSpeechService() {
         val stereo = if (decoded.channels >= 2) shorts else upmixToStereo(shorts)
         val pcm = toByteArray(stereo)
         Log.i(TAG, "prepared ${pcm.size / 2} shorts @ ${decoded.sampleRate}Hz stereo (no resample)")
-        if (cancelled.get()) {
-            try { callback.error() } catch (_: Exception) {}
+        if (gen != generation.get() || cancelled.get()) {
+            Log.i(TAG, "aborted before playback (stop during decode)")
             return
         }
 
@@ -398,32 +433,56 @@ class TtsEngineService : TextToSpeechService() {
             Log.i(TAG, "playing [$source] ${pcm.size / 2} samples @ ${decoded.sampleRate}Hz stereo")
             updateSessionState()
             val maxChunk = maxOf(1024, callback.maxBufferSize)
+            // Pace delivery to real time (stereo 16-bit: sampleRate * 2ch * 2B).
+            // Without pacing the whole utterance is handed to the framework in a
+            // few ms and marked done immediately, so a stop can never interrupt
+            // it: the framework has no "current" item to abort, onStop is never
+            // delivered, and the buffered audio keeps playing — the "won't stop"
+            // bug. Keeping the item current for its full duration lets stop()
+            // abort it and makes pause-hold/skip work per sentence.
+            val bytesPerMs = decoded.sampleRate * 2 * 2 / 1000.0
             var off = 0
-            while (off < pcm.size && !cancelled.get() && !skipCurrent.get()) {
+            while (off < pcm.size && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
                 // We are actively playing: cancel any pending idle timer so the
                 // session stays active and audio focus is held across sentences.
                 mainHandler.removeCallbacks(idleRunnable)
-                // Hold playback while paused (earphone pause or audio-focus loss).
-                while (isEffectivelyPaused && !cancelled.get()) {
+                // Hold playback while paused (earphone pause or audio-focus loss);
+                // a stop (generation bump) breaks the hold immediately.
+                while (isEffectivelyPaused && gen == generation.get() && !cancelled.get()) {
                     Thread.sleep(50)
                 }
-                if (cancelled.get()) break
+                if (gen != generation.get() || cancelled.get()) break
                 val n = minOf(maxChunk, pcm.size - off)
+                val chunkMs = (n / bytesPerMs).toLong()
+                val t0 = System.nanoTime()
                 callback.audioAvailable(pcm, off, n)
                 off += n
+                // Sleep the rest of the chunk's real-time duration, in cancelable
+                // steps so a stop/next still lands within ~50ms.
+                var remaining = chunkMs - (System.nanoTime() - t0) / 1_000_000
+                while (remaining > 0 && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
+                    val step = minOf(50L, remaining)
+                    Thread.sleep(step)
+                    remaining -= step
+                }
             }
-            if (cancelled.get()) {
-                // Framework/Moon Reader initiated stop: its queue is already aborted.
-                Log.i(TAG, "utterance ended by cancel")
+            if (gen != generation.get() || cancelled.get()) {
+                // Stop: the framework's stop path (synthesisCallback.stop() +
+                // onStop to the client) already halted the audio track, so just
+                // return silently. Do NOT call error(): clients like Moon Reader
+                // retry errored sentences, which would make reading continue
+                // after a stop. The framework's auto-done() then delivers
+                // onDone, which the client's stop-state guard ignores.
+                Log.i(TAG, "utterance ended by cancel (silent)")
             } else if (skipCurrent.get()) {
                 // Media NEXT: end this utterance so Moon Reader advances one sentence.
                 Log.i(TAG, "utterance skipped (media NEXT)")
-            }
-            // In all non-cancel cases, completing the utterance lets the framework
-            // continue with the next queued sentence. Moon Reader pre-queues several
-            // sentences, so a pause-hold never loses content: the queue stays parked
-            // and resumes exactly where it left off.
-            if (!cancelled.get()) {
+                try { callback.done() } catch (_: Exception) {}
+            } else {
+                // Completed normally: let the framework continue with the next queued
+                // sentence. Moon Reader pre-queues several sentences, so a pause-hold
+                // never loses content: the queue stays parked and resumes exactly
+                // where it left off.
                 try { callback.done() } catch (_: Exception) {}
             }
         } catch (e: Exception) {
@@ -436,7 +495,13 @@ class TtsEngineService : TextToSpeechService() {
 
     override fun onStop() {
         Log.i(TAG, "onStop: cancelling")
+        // Invalidate every in-flight AND already-queued utterance so nothing
+        // keeps fetching/playing after the user stopped, and clear any
+        // pause-hold so the next start is not blocked.
+        generation.incrementAndGet()
         cancelled.set(true)
+        pausedByUser.set(false)
+        pausedByFocus.set(false)
         mainHandler.postDelayed(idleRunnable, 200)
     }
 
