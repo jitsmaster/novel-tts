@@ -25,13 +25,23 @@ if [ -f "$AGENT_PLIST" ]; then
   rm -f "$AGENT_PLIST"
 fi
 
-# 2) Install the LaunchDaemon.
+# 2) Install the LaunchDaemon + the boot-volume launch wrapper.
+# The wrapper (/Library/LaunchDaemons/com.dsh.noveltts.wrapper.sh) lives on the
+# BOOT volume and waits for /Volumes/Satechi 1 to be mounted before starting
+# the server, so a late-mounting drive can't leave the server down after boot.
 SRC="$(cd "$(dirname "$0")" && pwd)/com.dsh.noveltts.plist"
 DEST="/Library/LaunchDaemons/com.dsh.noveltts.plist"
 echo "-> installing $DEST"
 cp "$SRC" "$DEST"
 chown root:wheel "$DEST"
 chmod 644 "$DEST"
+
+WRAPPER_SRC="$(cd "$(dirname "$0")" && pwd)/launch_wrapper.sh"
+WRAPPER_DEST="/Library/LaunchDaemons/com.dsh.noveltts.wrapper.sh"
+echo "-> installing $WRAPPER_DEST"
+cp "$WRAPPER_SRC" "$WRAPPER_DEST"
+chown root:wheel "$WRAPPER_DEST"
+chmod 755 "$WRAPPER_DEST"
 
 # 3) Load it in the system domain (fires now, and at every boot).
 launchctl bootout system/com.dsh.noveltts 2>/dev/null || true

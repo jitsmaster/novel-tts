@@ -5,24 +5,22 @@
     <key>Label</key><string>com.dsh.noveltts</string>
     <key>UserName</key><string>satechi</string>
     <key>GroupName</key><string>staff</string>
+    <!-- The wrapper lives on the BOOT volume (/Library/LaunchDaemons) and waits
+         for the external volume to be mounted before exec'ing the real server,
+         so a late-mounting drive no longer keeps the server down after boot. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Volumes/Satechi 1/dev/novel-tts/tts-server/.venv-local/bin/python</string>
-        <string>-m</string>
-        <string>uvicorn</string>
-        <string>tts_server:app</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>8321</string>
+        <string>/Library/LaunchDaemons/com.dsh.noveltts.wrapper.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HF_HUB_OFFLINE</key><string>1</string>
         <key>TRANSFORMERS_OFFLINE</key><string>1</string>
     </dict>
+    <!-- "/" is always present at boot; the wrapper cd's into the server dir
+         once the external volume is mounted. -->
     <key>WorkingDirectory</key>
-    <string>/Volumes/Satechi 1/dev/novel-tts/tts-server</string>
+    <string>/</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>/tmp/com.dsh.noveltts.out.log</string>

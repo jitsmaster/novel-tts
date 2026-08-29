@@ -31,10 +31,17 @@ server tier, and the server automatically falls back to the local Kokoro model �
   source kept in `tts-server/`, runs as user `satechi`).
   - `RunAtLoad` = starts at boot; `KeepAlive` = auto-restarts on crash.
   - Install / re-install (needs admin): `sudo ./tts-server/install_daemon.sh`
+    (also installs the launch wrapper below).
   - Reload after editing: `sudo launchctl bootout system/com.dsh.noveltts; sudo launchctl bootstrap system /Library/LaunchDaemons/com.dsh.noveltts.plist`
   - Sets `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` (models are cached; no network at boot).
-  - Caveat: the server lives on the external volume `/Volumes/Satechi 1` — if that
-    drive is not mounted when boot fires, launchd keeps retrying (KeepAlive) until it appears.
+  - **Launch wrapper** (`/Library/LaunchDaemons/com.dsh.noveltts.wrapper.sh`,
+    source `tts-server/launch_wrapper.sh`): the server lives on the external
+    volume `/Volumes/Satechi 1`, which may not be mounted yet when launchd fires
+    at boot. The wrapper (installed on the boot volume, always present) waits up
+    to 10 min for the drive to appear, then exec's the server; on timeout it
+    exits and launchd retries. The server therefore comes up automatically once
+    the drive is available — no manual reload needed. Wrapper log:
+    `/tmp/com.dsh.noveltts.wrapper.log`.
 - Endpoints: `GET /tts?text=…&voice=…&rate=…&pitch=…` → audio/mpeg (Edge) or audio/wav (Kokoro)
   `GET /health`, `GET /voices`
 - Per-sentence disk cache in `tts-server/cache/`
