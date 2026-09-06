@@ -85,6 +85,21 @@ class TtsEngineService : TextToSpeechService() {
     private val pausedByUser = AtomicBoolean(false)
     private val pausedByFocus = AtomicBoolean(false)
     private val skipCurrent = AtomicBoolean(false)
+    /**
+     * True from the moment an utterance is handed to us until it is done —
+     * including its fetch/decode phase, so the multi-second silent gap between
+     * sentences still counts as an active stream (the OS then routes a
+     * play/pause press as PAUSE, which parks the next sentence instead of being
+     * dropped as a no-op "play").
+     */
+    private val utteranceActive = AtomicBoolean(false)
+    /**
+     * True while a reading stream is parked in this process (an utterance is
+     * current or queued behind a pause-hold). A pause-hold is only resumable
+     * while engaged; a fresh utterance after the engine went idle is a new
+     * reading session and clears stale pause state.
+     */
+    private val engaged = AtomicBoolean(false)
 
     private var audioManager: AudioManager? = null
     private var mediaSession: MediaSession? = null
@@ -149,7 +164,11 @@ class TtsEngineService : TextToSpeechService() {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() = resumeTts()
                 override fun onPause() = pauseTts()
-                override fun onStop() = stopAll()
+                // Transport/media "stop" (lock screen, Assistant, some headsets)
+                // behaves like the receiver's KEYCODE_MEDIA_STOP: pause-and-hold,
+                // so Moon Reader never advances and resume keeps the same spot.
+                // Only the framework onStop() (client engine.stop()) ends reading.
+                override fun onStop() = pauseTts()
                 override fun onSkipToNext() { skipCurrent.set(true) }
             })
             setFlags(
@@ -180,12 +199,22 @@ class TtsEngineService : TextToSpeechService() {
             .setState(state, 0L, 1f)
             .build()
 
+    /**
+     * Report ONLY the truth to the system: PLAYING while PCM is actually being
+     * fed, PAUSED while a stream is held, NONE otherwise. Never report PLAYING
+     * while silent — the OS decides what a play/pause button press means from
+     * this state, so a fake "PLAYING" makes a would-be resume press arrive as
+     * a pause (the "need several presses to start" / "sometimes stops instead"
+     * feel).
+     */
     private fun updateSessionState() {
-        mediaSession?.setPlaybackState(
-            buildPlaybackState(
-                if (isEffectivelyPaused) PlaybackState.STATE_PAUSED else PlaybackState.STATE_PLAYING
-            )
-        )
+        val paused = isEffectivelyPaused
+        val state = when {
+            utteranceActive.get() && !paused -> PlaybackState.STATE_PLAYING
+            paused && (utteranceActive.get() || engaged.get()) -> PlaybackState.STATE_PAUSED
+            else -> PlaybackState.STATE_NONE
+        }
+        mediaSession?.setPlaybackState(buildPlaybackState(state))
     }
 
     private fun ensureAudioFocus() {
@@ -250,29 +279,31 @@ class TtsEngineService : TextToSpeechService() {
     private fun pauseTts() {
         pausedByUser.set(true)
         updateSessionState()
-        Log.i(TAG, "TTS paused (user)")
+        Log.i(TAG, "TTS paused (user) engaged=${engaged.get()} active=${utteranceActive.get()}")
     }
 
     private fun resumeTts() {
         pausedByUser.set(false)
+        // A resume must also lift a focus-induced pause; otherwise the stream
+        // stays frozen behind whichever app grabbed audio focus and play presses
+        // do nothing until the system happens to hand focus back.
+        if (pausedByFocus.get()) {
+            ensureAudioFocus()
+            if (hasFocus) pausedByFocus.set(false)
+            else Log.i(TAG, "resume deferred: audio focus still held elsewhere")
+        }
         updateSessionState()
-        Log.i(TAG, "TTS resumed (user)")
-    }
-
-    private fun stopAll() {
-        Log.i(TAG, "TTS stop all")
-        generation.incrementAndGet()
-        cancelled.set(true)
-        pausedByUser.set(false)
-        pausedByFocus.set(false)
-        updateSessionState()
-        mainHandler.postDelayed(idleRunnable, 200)
+        Log.i(TAG, "TTS resumed (user) engaged=${engaged.get()} active=${utteranceActive.get()}")
     }
 
     private fun goIdle() {
         Log.i(TAG, "goIdle")
+        engaged.set(false)
+        utteranceActive.set(false)
+        pausedByUser.set(false)
+        pausedByFocus.set(false)
         mediaSession?.isActive = false
-        mediaSession?.setPlaybackState(buildPlaybackState(PlaybackState.STATE_NONE))
+        updateSessionState()
         releaseAudioFocus()
     }
 
@@ -310,19 +341,28 @@ class TtsEngineService : TextToSpeechService() {
         val ratePct = "${request.speechRate - 100}%"
         val pitchHz = "${request.pitch - 100}Hz"
 
-        // A fresh utterance means the user wants audio now: clear any pause-hold
-        // left over from a previous pause/stop cycle (a stuck hold would
-        // otherwise block playback forever and make the engine appear dead),
-        // and capture the current generation so a stop that fired earlier also
-        // kills this task.
-        pausedByUser.set(false)
-        pausedByFocus.set(false)
+        // Only a FRESH stream (the engine was idle) means the user started
+        // reading and wants audio now: clear any stale pause-hold. A
+        // continuation utterance of the same stream (the next queued sentence)
+        // must NOT clear the pause — clearing it there is what made a pause
+        // taken at a sentence boundary "not stick". Capture the current
+        // generation so a stop that fired earlier also kills this task.
+        val fresh = engaged.compareAndSet(false, true)
+        if (fresh) {
+            pausedByUser.set(false)
+            pausedByFocus.set(false)
+            Log.i(TAG, "fresh stream started (cleared stale pause)")
+        }
         cancelled.set(false)
         skipCurrent.set(false)
         val gen = generation.get()
-        // New reading activity: stay "active" and stop the idle timer.
+        // New reading activity: stay "active" and stop the idle timer. The
+        // utterance counts as active from here until it is done (fetch, decode,
+        // paced playback and any pause-hold), so the reported playback state
+        // and the OS button routing stay truthful for the whole sentence.
         mainHandler.removeCallbacks(idleRunnable)
         mediaSession?.isActive = true
+        utteranceActive.set(true)
         ensureAudioFocus()
 
         // IMPORTANT: the framework requires this method to BLOCK until the
@@ -337,6 +377,9 @@ class TtsEngineService : TextToSpeechService() {
         } catch (e: Exception) {
             Log.e(TAG, "synthesis failed", e)
             try { callback.error() } catch (_: Exception) {}
+        } finally {
+            utteranceActive.set(false)
+            updateSessionState()
         }
     }
 
@@ -425,13 +468,24 @@ class TtsEngineService : TextToSpeechService() {
         }
 
         try {
+            // A pause may have arrived while this sentence was being
+            // fetched/decoded (there is a multi-second silent gap between
+            // sentences): park BEFORE creating the audio track so nothing leaks
+            // and resume starts cleanly at the sentence beginning.
+            while (isEffectivelyPaused && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
+                Thread.sleep(50)
+            }
+            if (gen != generation.get() || cancelled.get()) {
+                Log.i(TAG, "aborted before playback (stop during fetch)")
+                return
+            }
             callback.start(
                 decoded.sampleRate,
                 2,
                 android.media.AudioFormat.ENCODING_PCM_16BIT
             )
-            Log.i(TAG, "playing [$source] ${pcm.size / 2} samples @ ${decoded.sampleRate}Hz stereo")
             updateSessionState()
+            Log.i(TAG, "playing [$source] ${pcm.size / 2} samples @ ${decoded.sampleRate}Hz stereo")
             val maxChunk = maxOf(1024, callback.maxBufferSize)
             // Pace delivery to real time (stereo 16-bit: sampleRate * 2ch * 2B).
             // Without pacing the whole utterance is handed to the framework in a
@@ -448,22 +502,36 @@ class TtsEngineService : TextToSpeechService() {
                 mainHandler.removeCallbacks(idleRunnable)
                 // Hold playback while paused (earphone pause or audio-focus loss);
                 // a stop (generation bump) breaks the hold immediately.
-                while (isEffectivelyPaused && gen == generation.get() && !cancelled.get()) {
+                while (isEffectivelyPaused && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
                     Thread.sleep(50)
                 }
                 if (gen != generation.get() || cancelled.get()) break
+                if (skipCurrent.get()) break
                 val n = minOf(maxChunk, pcm.size - off)
                 val chunkMs = (n / bytesPerMs).toLong()
                 val t0 = System.nanoTime()
                 callback.audioAvailable(pcm, off, n)
                 off += n
                 // Sleep the rest of the chunk's real-time duration, in cancelable
-                // steps so a stop/next still lands within ~50ms.
+                // steps so a stop/next/pause still lands within ~50ms. Abort the
+                // sleep early when a pause arrives so the boundary hold below can
+                // park the utterance before it completes — otherwise a pause taken
+                // in the last chunk of a sentence is silently dropped.
                 var remaining = chunkMs - (System.nanoTime() - t0) / 1_000_000
-                while (remaining > 0 && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
+                while (remaining > 0 && gen == generation.get() && !cancelled.get() && !skipCurrent.get() && !isEffectivelyPaused) {
                     val step = minOf(50L, remaining)
                     Thread.sleep(step)
                     remaining -= step
+                }
+            }
+            // End-of-sentence boundary hold: the whole sentence has been fed but
+            // a pause arrived during the final chunk. Park here (before done())
+            // so the next queued sentence does not auto-start. Without this, a
+            // pause landing in the last ~200 ms of a sentence is lost and the
+            // reader just keeps talking.
+            if (off >= pcm.size && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
+                while (isEffectivelyPaused && gen == generation.get() && !cancelled.get() && !skipCurrent.get()) {
+                    Thread.sleep(50)
                 }
             }
             if (gen != generation.get() || cancelled.get()) {
@@ -489,6 +557,7 @@ class TtsEngineService : TextToSpeechService() {
             Log.e(TAG, "playback failed", e)
             try { callback.error() } catch (_: Exception) {}
         } finally {
+            updateSessionState()
             mainHandler.postDelayed(idleRunnable, IDLE_TIMEOUT_MS)
         }
     }
@@ -502,6 +571,9 @@ class TtsEngineService : TextToSpeechService() {
         cancelled.set(true)
         pausedByUser.set(false)
         pausedByFocus.set(false)
+        engaged.set(false)
+        utteranceActive.set(false)
+        updateSessionState()
         mainHandler.postDelayed(idleRunnable, 200)
     }
 
