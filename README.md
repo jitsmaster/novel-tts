@@ -58,10 +58,32 @@ server tier, and the server automatically falls back to the local Kokoro model �
     Reader never advances (no missed content on resume).
 - `EdgeTtsClient` — faithful Kotlin port of the edge-tts protocol (Sec-MS-GEC Long math,
   WSS + SSML, binary frame parse `[2-byte len][headers][\r\n\r\n][mp3]`), validated live.
-- MainActivity — test harness: bundled 三國志演義 excerpt (3088 sentences),
-  per-sentence latency, rate/pitch sliders, voice spinner, "force server only"
-  checkbox to exercise the Kokoro tier, editable server URL (defaults to the
-  Mac's Tailscale IP).
+- **Why there is no in-engine prefetch queue**: Android's TTS framework delivers one
+  utterance at a time (`TextToSpeechService.SynthHandler` serializes them on one
+  synthesis thread and auto-completes an utterance the moment `onSynthesizeText`
+  returns without `done()`), so an engine can never see the NEXT sentence's text
+  while the current one plays. Per-sentence generation latency therefore sits
+  between sentences — measured ~0.6–0.9 s (server/Kokoro render) on a cold
+  sentence, ~0.1 s on a server-cache hit, ~10 ms on a phone-cache hit.
+- `PreRenderer` — a "text → audio" queue that runs AHEAD of playback (the only
+  layer that can: it owns the source text). Paste a passage (or `adb shell am
+  start -n com.dsh.noveltts/.MainActivity -a com.dsh.noveltts.PRERENDER --ei
+  sampleCount 120`) and it renders each sentence into the phone sentence cache
+  through the same cascade + keys as live playback, so a later Moon Reader pass
+  over the same text is served from cache (measured: 613 ms → 13 ms fetch per
+  sentence). Moon Reader compatibility caveat: cache keys are byte-exact
+  `voice|rate|pitch|text`, so pre-rendered text must match Moon Reader's
+  utterance strings byte-for-byte (same source text incl. leading indents).
+  Moon Reader chunks one 。！？-terminated sentence per utterance.
+- MainActivity — settings + diagnostics: bundled 三國志演義 excerpt (3088
+  sentences), per-sentence latency, rate/pitch sliders, voice spinner, "force
+  server only" checkbox to exercise the Kokoro tier, sentence-cache size/clear,
+  Pre-render card, editable server URL. Test hooks via intent extras:
+  `--ez autoplay true --ei limit N` (play first N sample sentences) and
+  `-a com.dsh.noveltts.CLEAR_CACHE`.
+- Perf instrumentation: the engine logs one line per stage per utterance
+  (`[perf] req/fetch/decode/play/done` with ms + a punctuation profile), tag
+  `NovelTtsEngine` — the raw data behind the numbers above.
 - Playback path: decode to 24 kHz mono → upmix to stereo (the framework always
   creates a stereo AudioTrack; feeding mono makes it play 2x fast + high-pitched).
   No manual resampling — Android's pipeline converts 24→48 kHz with high quality.

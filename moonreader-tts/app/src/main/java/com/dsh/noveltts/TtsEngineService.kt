@@ -10,6 +10,7 @@ import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.speech.tts.SynthesisCallback
 import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
@@ -356,6 +357,12 @@ class TtsEngineService : TextToSpeechService() {
         cancelled.set(false)
         skipCurrent.set(false)
         val gen = generation.get()
+        val tReq = SystemClock.elapsedRealtime()
+        val enders = text.count { it == '。' || it == '！' || it == '？' || it == '；' }
+        val commas = text.count { it == '，' || it == '、' }
+        Log.i(TAG, "[perf] req gen=$gen len=${text.length} voice=$voice " +
+            "rate=${request.speechRate} pitch=${request.pitch} enders=$enders commas=$commas " +
+            "end=${text.lastOrNull()} first=${text.take(14).replace("\n", " ")}")
         // New reading activity: stay "active" and stop the idle timer. The
         // utterance counts as active from here until it is done (fetch, decode,
         // paced playback and any pause-hold), so the reported playback state
@@ -380,6 +387,7 @@ class TtsEngineService : TextToSpeechService() {
         } finally {
             utteranceActive.set(false)
             updateSessionState()
+            Log.i(TAG, "[perf] done gen=$gen totalMs=${SystemClock.elapsedRealtime() - tReq}")
         }
     }
 
@@ -409,6 +417,7 @@ class TtsEngineService : TextToSpeechService() {
         // previous utterance was still synthesizing), abort before any work.
         if (abortIfStale(gen, callback)) return
 
+        val tFetch = SystemClock.elapsedRealtime()
         // 1) cache
         var audio: ByteArray? = cache.get(key)
         var source = "cache"
@@ -440,6 +449,9 @@ class TtsEngineService : TextToSpeechService() {
         if (audio != null) {
             cache.put(key, audio)
         }
+        if (audio != null) {
+            Log.i(TAG, "[perf] fetch gen=$gen source=$source ms=${SystemClock.elapsedRealtime() - tFetch} bytes=${audio.size}")
+        }
         if (gen != generation.get() || cancelled.get()) {
             // Stop arrived while fetching: return silently. The framework's stop
             // path already notified the client; error() would make clients like
@@ -449,7 +461,9 @@ class TtsEngineService : TextToSpeechService() {
         }
 
         // decode
+        val tDecode = SystemClock.elapsedRealtime()
         val decoded = AudioDecoder.decode(audio!!)
+        Log.i(TAG, "[perf] decode gen=$gen ms=${SystemClock.elapsedRealtime() - tDecode}")
         Log.i(TAG, "decoded: ${decoded.pcm.size / 2} samples, ${decoded.sampleRate}Hz, ${decoded.channels}ch (source=$source)")
         // Feed the framework at the audio's NATIVE rate (24 kHz) — no manual
         // resampling. Android's audio pipeline does band-limited conversion to
@@ -486,6 +500,7 @@ class TtsEngineService : TextToSpeechService() {
             )
             updateSessionState()
             Log.i(TAG, "playing [$source] ${pcm.size / 2} samples @ ${decoded.sampleRate}Hz stereo")
+            val tPlay = SystemClock.elapsedRealtime()
             val maxChunk = maxOf(1024, callback.maxBufferSize)
             // Pace delivery to real time (stereo 16-bit: sampleRate * 2ch * 2B).
             // Without pacing the whole utterance is handed to the framework in a
@@ -524,6 +539,11 @@ class TtsEngineService : TextToSpeechService() {
                     remaining -= step
                 }
             }
+            val audioMs = pcm.size.toDouble() / 4 / decoded.sampleRate * 1000
+            Log.i(
+                TAG,
+                "[perf] play gen=$gen ms=${SystemClock.elapsedRealtime() - tPlay} audioMs=${audioMs.toInt()}"
+            )
             // End-of-sentence boundary hold: the whole sentence has been fed but
             // a pause arrived during the final chunk. Park here (before done())
             // so the next queued sentence does not auto-start. Without this, a

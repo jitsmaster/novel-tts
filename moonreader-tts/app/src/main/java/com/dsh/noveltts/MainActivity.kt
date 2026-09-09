@@ -47,12 +47,21 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusView: TextView
     private lateinit var logView: TextView
+    private lateinit var cacheInfo: TextView
     private lateinit var serverTestResult: TextView
     private lateinit var voiceToggle: MaterialButtonToggleGroup
     private lateinit var rateSlider: Slider
     private lateinit var pitchSlider: Slider
     private lateinit var serverField: TextInputEditText
     private lateinit var forceServer: MaterialSwitch
+
+    // Test hooks (adb): auto-start the excerpt and stop after N sentences.
+    private var autoplay = false
+    private var limit = Int.MAX_VALUE
+
+    // Pre-render card state
+    private lateinit var preText: TextInputEditText
+    private lateinit var preStatus: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
@@ -70,6 +79,11 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
+
+        // Test hooks (adb): --ez autoplay true --ei limit N
+        autoplay = intent.getBooleanExtra("autoplay", false)
+        val lim = intent.getIntExtra("limit", Int.MAX_VALUE)
+        limit = if (lim > 0) lim else Int.MAX_VALUE
 
         // Load the bundled novel excerpt (used only by Diagnostics).
         val raw = resources.openRawResource(R.raw.novel_sample).bufferedReader().use { it.readText() }
@@ -101,11 +115,46 @@ class MainActivity : AppCompatActivity() {
         })
 
         buildUi()
+        refreshCacheInfo()
+
+        // adb hook: pre-render without touching the UI.
+        //   adb shell am start -n com.dsh.noveltts/.MainActivity         //       -a com.dsh.noveltts.PRERENDER --ei sampleCount 120
+        // adb hook: clear the sentence cache (synchronous so a following
+        // force-stop cannot race the delete).
+        if (intent?.action == "com.dsh.noveltts.CLEAR_CACHE") {
+            SentenceCache(this).clear()
+            refreshCacheInfo()
+            appendLog("=== cache cleared (adb)")
+            android.util.Log.i("MainActivity", "cache cleared (adb)")
+        }
+
+        if (intent?.action == "com.dsh.noveltts.PRERENDER") {
+            val sampleCount = intent.getIntExtra("sampleCount", 0)
+            val text = intent.getStringExtra("text")
+            when {
+                !text.isNullOrBlank() -> startPreRender(text)
+                sampleCount > 0 -> startPreRenderUnits(sentences.take(sampleCount))
+            }
+        }
     }
 
     private fun ready() {
         engine.language = Locale.SIMPLIFIED_CHINESE
-        runOnUiThread { updateEngineStatus() }
+        runOnUiThread {
+            updateEngineStatus()
+            if (autoplay) startPlayback()
+        }
+    }
+
+    /** Shared by the Play button and the adb autoplay test hook. */
+    private fun startPlayback() {
+        index = 0
+        playing = true
+        ServerTtsClient.baseUrl = serverField.text?.toString()?.trim()
+            ?: Settings.DEFAULT_SERVER_URL
+        appendLog("=== Play: rate=${rateSlider.value} pitch=${pitchSlider.value} " +
+            "server=${ServerTtsClient.baseUrl} limit=$limit")
+        speakNext()
     }
 
     // ---- UI construction ----------------------------------------------------
@@ -136,6 +185,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(voiceCard())
         root.addView(playbackCard())
         root.addView(serverCard())
+        root.addView(preRenderCard())
         root.addView(howToCard())
         root.addView(diagnosticsCard())
 
@@ -313,6 +363,111 @@ class MainActivity : AppCompatActivity() {
         return card("How to use in Moon Reader", col)
     }
 
+    /**
+     * Pre-render queue: paste a passage and render it into the sentence cache
+     * AHEAD of playback, so a later Moon Reader / harness pass over the same
+     * text finds cache hits and there is no per-sentence generation wait.
+     * Renders on a background thread (PreRenderer) with the same cascade and
+     * cache keys as live playback.
+     */
+    private fun preRenderCard(): MaterialCardView {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        col.addView(
+            TextView(this).apply {
+                text = "Renders the pasted text into the sentence cache now " +
+                    "(no audio plays). Later, reading the SAME text is served " +
+                    "from cache: no wait between sentences. Cache keys include " +
+                    "voice/rate/pitch — this pre-renders with the current " +
+                    "Voice and Playback slider values."
+                textSize = 12f
+                setTextColor(0xFF666666.toInt())
+                setPadding(0, 0, 0, 10)
+            }
+        )
+
+        val input = TextInputLayout(this).apply {
+            hint = "Paste text to pre-render (Chinese passage / chapter)"
+            boxBackgroundMode = com.google.android.material.textfield.TextInputLayout.BOX_BACKGROUND_OUTLINE
+        }
+        preText = TextInputEditText(this).apply {
+            gravity = Gravity.TOP or Gravity.START
+            minLines = 5
+            maxLines = 8
+        }
+        input.addView(preText)
+        col.addView(input)
+
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val loadBtn = MaterialButton(this).apply { text = "Load sample (120 sents)" }
+        loadBtn.setOnClickListener {
+            preText.setText(sentences.take(120).joinToString(""))
+        }
+        val goBtn = MaterialButton(this).apply { text = "Pre-render" }
+        goBtn.setOnClickListener {
+            val text = preText.text?.toString()?.trim().orEmpty()
+            if (text.isNotEmpty()) startPreRender(text)
+        }
+        val cancelBtn = MaterialButton(this).apply { text = "Cancel" }
+        cancelBtn.setOnClickListener { PreRenderer.cancel() }
+        row.addView(loadBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(goBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(cancelBtn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        col.addView(row)
+
+        preStatus = TextView(this).apply {
+            textSize = 13f
+            text = "Idle. ~120 sentences take a few minutes over Edge/server."
+        }
+        col.addView(preStatus)
+
+        return card("Pre-render (queue ahead)", col)
+    }
+
+    private fun startPreRender(rawText: String) {
+        startPreRenderUnits(TextSegments.bySentence(rawText))
+    }
+
+    private fun startPreRenderUnits(units: List<String>) {
+        val voice = Settings.voice(this)
+        val ratePct = rateSlider.value.let { r ->
+            // Mirror the TextToSpeech client + TtsEngineService exactly:
+            // client sends round(rate*100); engine keys with (int - 100).
+            val pct = Math.round(r * 100f) - 100
+            if (pct > 0) "+$pct%" else "$pct%"
+        }
+        val pitchHz = pitchSlider.value.let { p ->
+            val hz = Math.round(p * 100f) - 100
+            if (hz > 0) "+${hz}Hz" else "${hz}Hz"
+        }
+        val nTotal = units.size
+        preStatus.text = "Pre-rendering $nTotal sentences (voice=$voice $ratePct $pitchHz)…"
+        appendLog("=== Pre-render start: $nTotal sentences, voice=$voice rate=$ratePct pitch=$pitchHz")
+        PreRenderer.startUnits(this, units, voice, ratePct, pitchHz,
+            object : PreRenderer.Listener {
+                override fun onProgress(done: Int, total: Int, cached: Int, fetched: Int, failed: Int, text: String) {
+                    if (done % 5 == 0 || done == total) {
+                        runOnUiThread {
+                            preStatus.text = "Pre-rendering $done/$total (cached=$cached fetched=$fetched failed=$failed)"
+                        }
+                    }
+                }
+
+                override fun onFinished(cancelled: Boolean, done: Int, total: Int, cached: Int, fetched: Int, failed: Int) {
+                    runOnUiThread {
+                        preStatus.text = if (cancelled) {
+                            "Cancelled at $done/$total (cached=$cached fetched=$fetched failed=$failed)"
+                        } else {
+                            "Done $done/$total — cached=$cached fetched=$fetched failed=$failed"
+                        }
+                        appendLog("=== Pre-render ${if (cancelled) "cancelled" else "done"}: " +
+                            "cached=$cached fetched=$fetched failed=$failed")
+                        refreshCacheInfo()
+                    }
+                }
+            })
+    }
+
     private fun diagnosticsCard(): MaterialCardView {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -326,18 +481,30 @@ class MainActivity : AppCompatActivity() {
         }
         col.addView(forceServer)
 
+        // TTS sentence cache: live size + manual clear (auto-trims above the
+        // budget in SentenceCache, but a manual clear is handy after a big read).
+        val cacheRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        cacheInfo = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 16, 0)
+        }
+        val cacheClear = MaterialButton(this).apply { text = "Clear cache" }
+        cacheClear.setOnClickListener {
+            Thread {
+                SentenceCache(this@MainActivity).clear()
+                refreshCacheInfo()
+                appendLog("=== TTS cache cleared")
+            }.start()
+        }
+        cacheRow.addView(cacheInfo, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        cacheRow.addView(cacheClear)
+        col.addView(cacheRow)
+
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val playBtn = MaterialButton(this).apply { text = "Play test excerpt" }
         val stopBtn = MaterialButton(this).apply { text = "Stop" }
-        playBtn.setOnClickListener {
-            index = 0
-            playing = true
-            ServerTtsClient.baseUrl = serverField.text?.toString()?.trim()
-                ?: Settings.DEFAULT_SERVER_URL
-            appendLog("=== Play: rate=${rateSlider.value} pitch=${pitchSlider.value} " +
-                "server=${ServerTtsClient.baseUrl}")
-            speakNext()
-        }
+        playBtn.setOnClickListener { startPlayback() }
         stopBtn.setOnClickListener {
             playing = false
             engine.stop()
@@ -357,6 +524,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---- engine status ------------------------------------------------------
+
+    private fun refreshCacheInfo() {
+        Thread {
+            try {
+                val (entries, bytes) = SentenceCache(this).stats()
+                val mb = bytes / 1024.0 / 1024.0
+                runOnUiThread {
+                    cacheInfo.text = String.format(
+                        java.util.Locale.US,
+                        "TTS cache: %.1f MB (%d entries)\nauto-trims above %d MB",
+                        mb, entries, SentenceCache.BUDGET_MB
+                    )
+                }
+            } catch (e: Exception) {
+                runOnUiThread { cacheInfo.text = "TTS cache: unavailable" }
+            }
+        }.start()
+    }
 
     private fun updateEngineStatus() {
         val isDefault = engine.defaultEngine == packageName
@@ -393,8 +578,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun speakNext() {
         if (!playing) return
-        if (index >= sentences.size) {
-            appendLog("=== Finished (${sentences.size} sentences)")
+        if (index >= sentences.size || index >= limit) {
+            appendLog("=== Finished at $index (limit=$limit of ${sentences.size} sentences)")
+            playing = false
             return
         }
         val text = sentences[index]
@@ -419,8 +605,5 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    private fun splitSentences(raw: String): List<String> {
-        val regex = Regex("[^。！？；\\n]+[。！？；]?")
-        return regex.findAll(raw).map { it.value.trim() }.filter { it.isNotEmpty() }.toList()
-    }
+    private fun splitSentences(raw: String): List<String> = TextSegments.bySentence(raw)
 }
