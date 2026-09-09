@@ -74,9 +74,20 @@ class TtsEngineService : TextToSpeechService() {
         @Volatile
         private var instance: TtsEngineService? = null
 
+        /** Last playback state reported to the MediaSession (NONE/PAUSED/PLAYING). */
+        @Volatile
+        var lastPlaybackState: Int = PlaybackState.STATE_NONE
+            private set
+
         fun handleMediaKey(keyCode: Int) {
             instance?.onMediaKey(keyCode)
         }
+
+        /** True while the engine holds a pause (user or audio-focus). */
+        fun isPaused(): Boolean = instance?.isEffectivelyPaused ?: false
+
+        /** Reader UI state mirror: engine active + speaking. */
+        fun isSpeaking(): Boolean = instance?.utteranceActive?.get() ?: false
     }
 
     private lateinit var cache: SentenceCache
@@ -216,6 +227,7 @@ class TtsEngineService : TextToSpeechService() {
             else -> PlaybackState.STATE_NONE
         }
         mediaSession?.setPlaybackState(buildPlaybackState(state))
+        lastPlaybackState = state
     }
 
     private fun ensureAudioFocus() {
