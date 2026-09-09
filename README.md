@@ -81,6 +81,11 @@ server tier, and the server automatically falls back to the local Kokoro model �
   Pre-render card, editable server URL. Test hooks via intent extras:
   `--ez autoplay true --ei limit N` (play first N sample sentences) and
   `-a com.dsh.noveltts.CLEAR_CACHE`.
+- **Library bookshelf**: 📂 in the reader opens your books folder (picked
+  once via the system folder picker, defaulting to /sdcard/Books where Moon
+  Reader keeps novels) and lists every .txt/.epub as a tappable row — no more
+  digging through the system "Recents" sheet, and switching books is one tap.
+  Parsed books are cached on disk, so re-opening is near-instant.
 - **Standalone audiobook reader (no Moon Reader)** — `ReaderActivity` +
   `AudioBookService`: open any `.txt` novel (system picker), auto chapter
   parsing, reads PARAGRAPH-SIZED blocks through its own AudioTrack player (no

@@ -4,8 +4,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.SharedPreferences
 import android.net.Uri
+import android.provider.DocumentsContract
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.Bundle
 import android.text.Spannable
@@ -39,11 +40,76 @@ class ReaderActivity : AppCompatActivity() {
         private const val KEY_NAME = "book_name"
         private const val KEY_CH = "chapter"
         private const val KEY_BLOCK = "block"
+        private const val KEY_TREE = "library_tree"
+        private const val KEY_TREE_DIR = "library_dir"
     }
 
+    // Library (bookshelf) state
+    private val dirStack = ArrayList<String>()          // document ids, root first
+    private val libFiles = ArrayList<Pair<String, Uri>>()
+    private lateinit var libraryView: android.widget.LinearLayout
+    private lateinit var libraryScroll: ScrollView
+
     private val openBook = registerForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri -> if (uri != null) { persistUri(uri); loadBook(uri) } }
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        val uri = res.data?.data
+        if (uri != null) { persistUri(uri); loadBook(uri) }
+    }
+
+    private val openTree = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        val uri = res.data?.data ?: return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {}
+        prefs().edit().putString(KEY_TREE, uri.toString()).apply()
+        dirStack.clear()
+        dirStack.add(DocumentsContract.getTreeDocumentId(uri))
+        openLibrary()
+    }
+
+    private fun treePickerIntent(): Intent =
+        Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            try {
+                putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    DocumentsContract.buildDocumentUri(
+                        "com.android.externalstorage.documents", "primary:Books"
+                    )
+                )
+            } catch (_: Exception) {}
+        }
+
+    /** Build the open-document intent, starting at the Moon Reader books
+     *  folder (/sdcard/Books) when present — the system sheet otherwise opens
+     *  on "Recents", which only ever lists the previously opened book. */
+    private fun openBookIntent(): Intent {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(
+                Intent.EXTRA_MIME_TYPES,
+                arrayOf("application/epub+zip", "text/plain", "text/*", "application/octet-stream")
+            )
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        // Open the picker at /sdcard/Books (Moon Reader's usual library
+        // folder) when possible. No existence probe: querying a non-granted
+        // document throws, and DocumentsUI falls back gracefully if the
+        // folder is missing.
+        try {
+            val books = DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents", "primary:Books"
+            )
+            i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, books)
+        } catch (_: Exception) {}
+        return i
+    }
 
     private var novel: Novel? = null
     private var chapterIdx = 0
@@ -69,6 +135,11 @@ class ReaderActivity : AppCompatActivity() {
     private lateinit var playBtn: MaterialButton
 
     private val chapter: Chapter? get() = novel?.chapters?.getOrNull(chapterIdx)
+
+    // Monotonic guard so only the MOST RECENT load request may apply its
+    // result (auto-restore racing with a freshly picked book caused the
+    // reader to keep showing the old book).
+    private val loadToken = java.util.concurrent.atomic.AtomicLong(0)
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -123,6 +194,11 @@ class ReaderActivity : AppCompatActivity() {
         when {
             testFile != null -> loadTestFile(testFile!!)
             sourceSample -> loadSample()
+            prefs().getString(KEY_TREE, null) != null && saved == null && !autoplay -> {
+                dirStack.clear()
+                dirStack.add(DocumentsContract.getTreeDocumentId(Uri.parse(prefs().getString(KEY_TREE, null)!!)))
+                renderLibrary()
+            }
             saved != null -> {
                 val uri = Uri.parse(saved)
                 try {
@@ -143,6 +219,7 @@ class ReaderActivity : AppCompatActivity() {
             try {
                 val f = java.io.File(filesDir, name)
                 val uriKey = "file:$name"
+                val tok = loadToken.incrementAndGet()
                 val t0 = System.currentTimeMillis()
                 val bytes = f.readBytes()
                 val cached = NovelCache.load(this, uriKey, bytes.size.toLong())
@@ -152,10 +229,12 @@ class ReaderActivity : AppCompatActivity() {
                 android.util.Log.i("ReaderLoad", "file load ${n?.chapters?.size} chapters in " +
                     "${System.currentTimeMillis() - t0}ms " +
                     (if (cached != null) "(cache)" else "(parsed)"))
+                if (tok != loadToken.get()) return@Thread
                 if (n == null) {
                     runOnUiThread { statusView.text = "无法解析文件（非文本/EPUB）" }
                 } else {
                     runOnUiThread {
+                        if (tok != loadToken.get()) return@runOnUiThread
                         onParsed(n, name)
                         if (autoplay) startChapter()
                     }
@@ -167,12 +246,14 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     private fun loadSample() {
+        val tok = loadToken.incrementAndGet()
         statusView.text = "解析样本…"
         Thread {
             val raw = resources.openRawResource(R.raw.novel_sample)
                 .bufferedReader().use { it.readText() }
             val n = NovelParser.parse(raw)
             runOnUiThread {
+                if (tok != loadToken.get()) return@runOnUiThread
                 onParsed(n, "三國志演義(樣本)")
                 if (autoplay || sourceSample) startChapter()
             }
@@ -181,19 +262,21 @@ class ReaderActivity : AppCompatActivity() {
 
     private fun prefs(): SharedPreferences = getSharedPreferences(PREFS, MODE_PRIVATE)
 
-    private fun persistUri(uri: Uri) {
+    private fun persistUri(uri: Uri, nameHint: String? = null) {
         try {
             contentResolver.takePersistableUriPermission(
                 uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
         } catch (_: Exception) {}
         bookUri = uri
-        bookName = uri.lastPathSegment?.substringAfterLast('/')?.substringBefore('_') ?: "书"
+        bookName = nameHint
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.substringBefore('_') ?: "书"
         prefs().edit().putString(KEY_URI, uri.toString()).putString(KEY_NAME, bookName)
             .putInt(KEY_CH, 0).putInt(KEY_BLOCK, 0).apply()
     }
 
     private fun loadBook(uri: Uri) {
+        val tok = loadToken.incrementAndGet()
         statusView.text = "解析中…"
         bookUri = uri
         if (bookName.isBlank()) {
@@ -212,12 +295,14 @@ class ReaderActivity : AppCompatActivity() {
                 android.util.Log.i("ReaderLoad", "loaded ${n?.chapters?.size} chapters in " +
                     "${System.currentTimeMillis() - t0}ms " +
                     (if (cached != null) "(cache)" else "(parsed)"))
+                if (tok != loadToken.get()) return@Thread   // superseded
                 if (n == null) {
                     runOnUiThread { statusView.text = "无法解析（仅支持 .txt 与 .epub）" }
                     return@Thread
                 }
                 val savedUri = prefs().getString(KEY_URI, null)
                 runOnUiThread {
+                    if (tok != loadToken.get()) return@runOnUiThread
                     if (uri.toString() == savedUri) {
                         val nc = n.chapters.size
                         chapterIdx = prefs().getInt(KEY_CH, 0).coerceIn(0, (nc - 1).coerceAtLeast(0))
@@ -261,6 +346,121 @@ class ReaderActivity : AppCompatActivity() {
         renderChapter()
     }
 
+    // ---- library (bookshelf) ----------------------------------------------
+
+    private fun isBookFile(name: String): Boolean {
+        val n = name.lowercase()
+        return n.endsWith(".txt") || n.endsWith(".epub")
+    }
+
+    private fun listDir(dirDocId: String): List<Triple<String, String, Uri>> {
+        // name, type("dir"/file mime or ""), uri
+        val tree = prefs().getString(KEY_TREE, null) ?: return emptyList()
+        val out = ArrayList<Triple<String, String, Uri>>()
+        try {
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(
+                Uri.parse(tree), dirDocId
+            )
+            contentResolver.query(
+                children,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: continue
+                    val mime = c.getString(2) ?: ""
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(
+                        Uri.parse(tree), id
+                    )
+                    if (DocumentsContract.Document.MIME_TYPE_DIR == mime) {
+                        out.add(Triple(name, "dir", docUri))
+                    } else if (isBookFile(name)) {
+                        out.add(Triple(name, mime, docUri))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("Library", "list failed: ${e.message}")
+        }
+        out.sortBy { (it.first != "dir").compareTo(false) }
+        out.sortBy { it.first.lowercase() }
+        return out
+    }
+
+    private fun openLibrary() {
+        val tree = prefs().getString(KEY_TREE, null) ?: run {
+            openTree.launch(treePickerIntent())
+            return
+        }
+        try {
+            contentResolver.takePersistableUriPermission(
+                Uri.parse(tree), Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {}
+        if (dirStack.isEmpty()) dirStack.add(DocumentsContract.getTreeDocumentId(Uri.parse(tree)))
+        renderLibrary()
+    }
+
+    private fun renderLibrary() {
+        val dirDocId = dirStack.last()
+        Thread {
+            val items = listDir(dirDocId)
+            runOnUiThread { renderLibraryUi(items, dirDocId) }
+        }.start()
+    }
+
+    private fun renderLibraryUi(items: List<Triple<String, String, Uri>>, dirDocId: String) {
+        libraryView.removeAllViews()
+        fun row(label: String, sub: String?, onClick: () -> Unit) {
+            val tv = TextView(this).apply {
+                text = buildString {
+                    append(label)
+                    if (sub != null) append("   ").append(sub)
+                }
+                textSize = 18f
+                setPadding(28, 26, 28, 26)
+                isClickable = true
+                setOnClickListener { onClick() }
+            }
+            libraryView.addView(tv)
+        }
+        val depth = dirStack.size
+        if (depth > 1) {
+            row("⬆ 返回上层", null, { dirStack.removeAt(dirStack.size - 1); renderLibrary() })
+        } else {
+            row("✕ 关闭书库", null, { libraryScroll.visibility = android.view.View.GONE
+                scrollView.visibility = android.view.View.VISIBLE })
+            row("📂 更换文件夹…", null, { openTree.launch(treePickerIntent()) })
+            row("➕ 从其他位置选择文件…", null, { openBook.launch(openBookIntent()) })
+            row("—— ${items.size} 个 txt/epub ——", null, {})
+        }
+        scrollView.visibility = android.view.View.GONE
+        for ((name, type, uri) in items) {
+            if (type == "dir") {
+                row("📁  $name", "文件夹", {
+                    dirStack.add(DocumentsContract.getDocumentId(uri))
+                    renderLibrary()
+                })
+            } else {
+                row("📖  $name", null, {
+                    persistUri(uri, name)
+                    libraryScroll.visibility = android.view.View.GONE
+                    loadBook(uri)
+                })
+            }
+        }
+        libraryScroll.visibility = android.view.View.VISIBLE
+        if (items.isEmpty()) {
+            row("（此文件夹内没有 .txt / .epub）", null) {}
+        }
+        if (dirDocId.isNotEmpty()) prefs().edit().putString(KEY_TREE_DIR, dirDocId).apply()
+    }
+
     // ---- UI ---------------------------------------------------------------
 
     private fun buildUi() {
@@ -293,6 +493,19 @@ class ReaderActivity : AppCompatActivity() {
         scrollView.addView(chapterView)
         root.addView(scrollView)
 
+        libraryScroll = ScrollView(this).apply {
+            visibility = android.view.View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
+        libraryView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 4, 0, 20)
+        }
+        libraryScroll.addView(libraryView)
+        root.addView(libraryScroll)
+
         fun row(vararg specs: Pair<MaterialButton, Float>) {
             val bar = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -322,9 +535,7 @@ class ReaderActivity : AppCompatActivity() {
                 )
             }
 
-        val openB = iconBtn("📂", "打开小说", 1f) {
-            openBook.launch(arrayOf("application/epub+zip", "text/*", "text/plain", "application/octet-stream"))
-        }
+        val openB = iconBtn("📂", "书库", 1f) { openLibrary() }
         val prevCh = iconBtn("⏮", "上一章", 1f) { jumpChapter(chapterIdx - 1) }
         val backPg = iconBtn("⏪", "上一段", 1f) { AudioBookService.control(this, AudioBookService.ACTION_PREV_BLOCK) }
         playBtn = iconBtn("▶", "播放/暂停", 1f) { togglePlay() }
