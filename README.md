@@ -81,6 +81,13 @@ server tier, and the server automatically falls back to the local Kokoro model �
   Pre-render card, editable server URL. Test hooks via intent extras:
   `--ez autoplay true --ei limit N` (play first N sample sentences) and
   `-a com.dsh.noveltts.CLEAR_CACHE`.
+- **Standalone audiobook reader (no Moon Reader)** — `ReaderActivity` +
+  `AudioBookService`: open any `.txt` novel (system picker), auto chapter
+  parsing, reads PARAGRAPH-SIZED blocks through its own AudioTrack player (no
+  Android TTS framework), so playback is gapless, pausable at any instant, and
+  seekable by previous/next block. Earphone buttons map: play/pause/stop +
+  prev/next block (double/triple-click or rewind/fast-forward keys). Foreground
+  service keeps reading with the screen off; position is saved per book.
 - Perf instrumentation: the engine logs one line per stage per utterance
   (`[perf] req/fetch/decode/play/done` with ms + a punctuation profile), tag
   `NovelTtsEngine` — the raw data behind the numbers above.

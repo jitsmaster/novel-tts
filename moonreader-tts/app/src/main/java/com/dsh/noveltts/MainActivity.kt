@@ -182,6 +182,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.addView(engineStatusCard())
+        root.addView(readerCard())
         root.addView(voiceCard())
         root.addView(playbackCard())
         root.addView(serverCard())
@@ -240,6 +241,27 @@ class MainActivity : AppCompatActivity() {
         col.addView(statusView)
         col.addView(btn)
         return card("Engine status", col)
+    }
+
+    /** Standalone audiobook reader (no Moon Reader / no TTS framework). */
+    private fun readerCard(): MaterialCardView {
+        val btn = MaterialButton(this).apply {
+            text = "📖 打开小说阅读器（无需 Moon Reader）"
+        }
+        btn.setOnClickListener {
+            startActivity(Intent(this, ReaderActivity::class.java))
+        }
+        val note = TextView(this).apply {
+            text = "读取本地 .txt 小说：可随时播放/暂停，⟲/⟳ 10 秒，" +
+                "耳机键同样控制；锁屏后继续朗读。"
+            textSize = 12f
+            setTextColor(0xFF666666.toInt())
+            setPadding(0, 8, 0, 0)
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(btn)
+        col.addView(note)
+        return card("Reader", col)
     }
 
     private fun voiceCard(): MaterialCardView {

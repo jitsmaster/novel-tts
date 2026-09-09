@@ -21,6 +21,12 @@ class MediaButtonReceiver : BroadcastReceiver() {
             intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
         }
         if (event == null || event.action != KeyEvent.ACTION_DOWN) return
-        TtsEngineService.handleMediaKey(event.keyCode)
+        // Route to whichever player is active: the standalone audiobook player
+        // if the reader started it, otherwise the TTS engine service.
+        if (AudioBookService.instanceHandle() != null) {
+            AudioBookService.handleKey(event.keyCode)
+        } else {
+            TtsEngineService.handleMediaKey(event.keyCode)
+        }
     }
 }
