@@ -316,8 +316,7 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(
             TextView(this).apply {
-                text = "These apply to the test in Diagnostics. Moon Reader's own " +
-                    "TTS panel (Volume/Pitch/Speed) overrides them while reading."
+                text = "Reader playback speed/rate (applies to the audiobook player and the diagnostics harness)."
                 textSize = 12f
                 setTextColor(0xFF888888.toInt())
             }

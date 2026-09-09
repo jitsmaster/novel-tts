@@ -58,6 +58,7 @@ class ReaderActivity : AppCompatActivity() {
 
     private var autoplay = false
     private var sourceSample = false
+    private var testFile: String? = null
     private var testLimit = Int.MAX_VALUE
     private var testSpoken = 0
 
@@ -108,6 +109,7 @@ class ReaderActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         autoplay = intent.getBooleanExtra("autoplay", false)
         sourceSample = intent.getBooleanExtra("sample", false)
+        testFile = intent.getStringExtra("file")
         testLimit = intent.getIntExtra("limit", Int.MAX_VALUE)
         buildUi()
         val filter = IntentFilter(AudioBookService.ACTION_STATE)
@@ -119,6 +121,7 @@ class ReaderActivity : AppCompatActivity() {
         }
         val saved = prefs().getString(KEY_URI, null)
         when {
+            testFile != null -> loadTestFile(testFile!!)
             sourceSample -> loadSample()
             saved != null -> {
                 val uri = Uri.parse(saved)
@@ -132,6 +135,35 @@ class ReaderActivity : AppCompatActivity() {
             autoplay -> loadSample()
             else -> statusView.text = "打开一个 .txt 小说即可收听；播放键/耳机键随时可用。"
         }
+    }
+
+    private fun loadTestFile(name: String) {
+        statusView.text = "解析文件 $name…"
+        Thread {
+            try {
+                val f = java.io.File(filesDir, name)
+                val uriKey = "file:$name"
+                val t0 = System.currentTimeMillis()
+                val bytes = f.readBytes()
+                val cached = NovelCache.load(this, uriKey, bytes.size.toLong())
+                val n = cached ?: parseBytes(bytes, name)?.also {
+                    NovelCache.save(this, uriKey, bytes.size.toLong(), it)
+                }
+                android.util.Log.i("ReaderLoad", "file load ${n?.chapters?.size} chapters in " +
+                    "${System.currentTimeMillis() - t0}ms " +
+                    (if (cached != null) "(cache)" else "(parsed)"))
+                if (n == null) {
+                    runOnUiThread { statusView.text = "无法解析文件（非文本/EPUB）" }
+                } else {
+                    runOnUiThread {
+                        onParsed(n, name)
+                        if (autoplay) startChapter()
+                    }
+                }
+            } catch (e: Exception) {
+                runOnUiThread { statusView.text = "打开失败: ${e.message}" }
+            }
+        }.start()
     }
 
     private fun loadSample() {
@@ -164,20 +196,26 @@ class ReaderActivity : AppCompatActivity() {
     private fun loadBook(uri: Uri) {
         statusView.text = "解析中…"
         bookUri = uri
+        if (bookName.isBlank()) {
+            bookName = prefs().getString(KEY_NAME, null)
+                ?: uri.lastPathSegment?.substringAfterLast('/')?.substringBefore('_') ?: "书"
+        }
         Thread {
             try {
                 val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     ?: throw Exception("无法打开文件")
-                var text: String? = null
-                try {
-                    text = Charset.forName("UTF-8").newDecoder()
-                        .onMalformedInput(CodingErrorAction.REPORT)
-                        .onUnmappableCharacter(CodingErrorAction.REPORT)
-                        .decode(ByteBuffer.wrap(bytes)).toString()
-                } catch (_: Exception) {
-                    text = String(bytes, Charset.forName("GB18030"))
+                val t0 = System.currentTimeMillis()
+                val cached = NovelCache.load(this, uri.toString(), bytes.size.toLong())
+                val n: Novel? = cached ?: parseBytes(bytes, bookName)?.also {
+                    NovelCache.save(this, uri.toString(), bytes.size.toLong(), it)
                 }
-                val n = NovelParser.parse(text)
+                android.util.Log.i("ReaderLoad", "loaded ${n?.chapters?.size} chapters in " +
+                    "${System.currentTimeMillis() - t0}ms " +
+                    (if (cached != null) "(cache)" else "(parsed)"))
+                if (n == null) {
+                    runOnUiThread { statusView.text = "无法解析（仅支持 .txt 与 .epub）" }
+                    return@Thread
+                }
                 val savedUri = prefs().getString(KEY_URI, null)
                 runOnUiThread {
                     if (uri.toString() == savedUri) {
@@ -192,6 +230,28 @@ class ReaderActivity : AppCompatActivity() {
                 runOnUiThread { statusView.text = "打开失败: ${e.message}" }
             }
         }.start()
+    }
+
+    /** Sniff: EPUB (zip magic) -> EpubParser, else decode txt (UTF-8/GB18030). */
+    private fun parseBytes(bytes: ByteArray, name: String): Novel? {
+        if (bytes.size >= 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()) {
+            val r = EpubParser.parse(bytes, name)
+            if (r.error != null) {
+                runOnUiThread { statusView.text = r.error }
+                return null
+            }
+            return r.novel
+        }
+        var text: String? = null
+        try {
+            text = Charset.forName("UTF-8").newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes)).toString()
+        } catch (_: Exception) {
+            text = String(bytes, Charset.forName("GB18030"))
+        }
+        return NovelParser.parse(text)
     }
 
     private fun onParsed(n: Novel, name: String) {
@@ -263,7 +323,7 @@ class ReaderActivity : AppCompatActivity() {
             }
 
         val openB = iconBtn("📂", "打开小说", 1f) {
-            openBook.launch(arrayOf("text/*", "text/plain", "application/octet-stream"))
+            openBook.launch(arrayOf("application/epub+zip", "text/*", "text/plain", "application/octet-stream"))
         }
         val prevCh = iconBtn("⏮", "上一章", 1f) { jumpChapter(chapterIdx - 1) }
         val backPg = iconBtn("⏪", "上一段", 1f) { AudioBookService.control(this, AudioBookService.ACTION_PREV_BLOCK) }
@@ -274,19 +334,61 @@ class ReaderActivity : AppCompatActivity() {
             AudioBookService.control(this, AudioBookService.ACTION_STOP)
             autoAdvance = false
         }
+        // Speed dial (also the persisted rate that MainActivity's slider shows).
+        val speeds = floatArrayOf(0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+        var speedIdx = speeds.indexOfFirst { kotlin.math.abs(it - Settings.rate(this)) < 0.01f }
+            .takeIf { it >= 0 } ?: 1
+        val speedBtn = MaterialButton(this).apply {
+            text = fmtSpeed(speeds[speedIdx])
+            textSize = 18f
+            isAllCaps = false
+            minWidth = 0
+            minHeight = 0
+            contentDescription = "朗读速度"
+            setOnClickListener {
+                speedIdx = (speedIdx + 1) % speeds.size
+                Settings.setRate(this@ReaderActivity, speeds[speedIdx])
+                text = fmtSpeed(speeds[speedIdx])
+                AudioBookService.control(this@ReaderActivity, AudioBookService.ACTION_SPEED)
+            }
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
         // Two rows so the icon buttons are never clipped.
         row(prevCh to 1f, backPg to 1f, playBtn to 1.25f, fwdPg to 1f, nextCh to 1f)
-        row(openB to 2f, stopB to 1f)
+        row(openB to 1.4f, speedBtn to 1f, stopB to 1f)
 
         setContentView(root)
         titleView.text = "📖 小说阅读器"
     }
 
+    private fun fmtSpeed(s: Float): String {
+        val r = String.format(java.util.Locale.US, "%.2f", s).trimEnd('0').trimEnd('.')
+        return "$r×"
+    }
+
     // ---- rendering --------------------------------------------------------
+
+    // Display text for the current chapter is built ONCE per chapter and
+    // reused for every highlight update (block change) — rebuilding the whole
+    // chapter string per block was wasteful.
+    private var chapterDisplayText: String? = null
+    private var chapterDisplayStarts: IntArray? = null
+
+    private fun buildChapterDisplay(ch: Chapter): Pair<String, IntArray> {
+        val sb = StringBuilder()
+        val starts = IntArray(ch.blocks.size)
+        for (i in ch.blocks.indices) {
+            starts[i] = sb.length
+            sb.append(ch.blocks[i]).append("\n\n")
+        }
+        return sb.toString() to starts
+    }
 
     private fun renderChapter() {
         val n = novel ?: return
         val ch = chapter ?: return
+        chapterDisplayText = null
+        chapterDisplayStarts = null
         titleView.text = "${n.title}\n${ch.title}"
         statusView.text = "第 ${chapterIdx + 1}/${n.chapters.size} 章"
         renderBlockHighlight()
@@ -294,15 +396,16 @@ class ReaderActivity : AppCompatActivity() {
 
     private fun renderBlockHighlight() {
         val ch = chapter ?: return
-        val sb = StringBuilder()
-        val starts = IntArray(ch.blocks.size)
-        for (i in ch.blocks.indices) {
-            starts[i] = sb.length
-            sb.append(ch.blocks[i]).append("\n\n")
+        if (chapterDisplayText == null) {
+            val (t, st) = buildChapterDisplay(ch)
+            chapterDisplayText = t
+            chapterDisplayStarts = st
         }
-        val sp = SpannableString(sb.toString())
+        val text = chapterDisplayText ?: return
+        val starts = chapterDisplayStarts ?: return
+        val sp = SpannableString(text)
         val b = blockIdx.coerceIn(0, ch.blocks.size - 1)
-        val end = if (b + 1 < ch.blocks.size) starts[b + 1] else sb.length
+        val end = if (b + 1 < ch.blocks.size) starts[b + 1] else text.length
         sp.setSpan(BackgroundColorSpan(0x30FFB300.toInt()), starts[b], end,
             Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
         chapterView.setText(sp, TextView.BufferType.SPANNABLE)

@@ -102,6 +102,9 @@ object NovelParser {
     private fun String.endsWithAny(suffixes: String): Boolean =
         suffixes.any { this.endsWith(it) }
 
+    /** Public entry used by EpubParser (same block sizing as txt parsing). */
+    fun makeBlocks(paragraphs: List<String>): List<String> = buildBlocks(paragraphs)
+
     /** Paragraphs -> sentence-bounded blocks of roughly BLOCK_TARGET chars. */
     private fun buildBlocks(paragraphs: List<String>): List<String> {
         val blocks = mutableListOf<String>()

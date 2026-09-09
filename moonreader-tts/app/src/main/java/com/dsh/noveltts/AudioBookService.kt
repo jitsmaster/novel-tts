@@ -53,6 +53,7 @@ class AudioBookService : Service() {
         const val ACTION_SEEK = "com.dsh.noveltts.audio.SEEK"      // extra "deltaMs"
         const val ACTION_NEXT_BLOCK = "com.dsh.noveltts.audio.NEXT_BLOCK"
         const val ACTION_PREV_BLOCK = "com.dsh.noveltts.audio.PREV_BLOCK"
+        const val ACTION_SPEED = "com.dsh.noveltts.audio.SPEED"   // re-read Settings.rate
         const val EXTRA_BOOK = "book"
         const val EXTRA_BLOCKS = "blocks"
         const val EXTRA_FROM = "fromBlock"
@@ -160,8 +161,29 @@ class AudioBookService : Service() {
             ACTION_SEEK -> seekBy(intent.getIntExtra(EXTRA_DELTA, 0))
             ACTION_NEXT_BLOCK -> skipTo(blockIndex + 1)
             ACTION_PREV_BLOCK -> skipTo(blockIndex - 1)
+            ACTION_SPEED -> applySpeedToTrack()
         }
         return START_NOT_STICKY
+    }
+
+    @Volatile
+    private var currentSpeed = 1.0f
+
+    /** Read the persisted speed (Settings.rate) and apply to the live track. */
+    private fun applySpeedToTrack() {
+        val s = Settings.rate(applicationContext).coerceIn(0.5f, 2.0f)
+        currentSpeed = s
+        try {
+            val tr = track
+            if (tr != null && tr.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                tr.setPlaybackParams(
+                    android.media.PlaybackParams().setSpeed(s)
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "setPlaybackParams failed: ${e.message}")
+        }
+        Log.i(TAG, "speed set to ${s}x")
     }
 
     private fun ensureForeground() {
@@ -311,6 +333,7 @@ class AudioBookService : Service() {
         track = tr
         try {
             tr.play()
+            applySpeedToTrack()
             var off = 0
             while (off < stereo.size && gen.get() == myGen && !stopRequested.get()) {
                 while (pauseRequested.get() && !stopRequested.get() && gen.get() == myGen) {
