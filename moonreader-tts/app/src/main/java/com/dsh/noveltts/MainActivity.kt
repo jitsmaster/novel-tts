@@ -6,6 +6,7 @@ import android.provider.Settings as AndroidSettings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
+import android.view.View
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -268,14 +269,15 @@ class MainActivity : AppCompatActivity() {
         voiceToggle = MaterialButtonToggleGroup(this).apply {
             isSingleSelection = true
             val saved = Settings.voice(this@MainActivity)
+            var savedBtn: MaterialButton? = null
             for (v in TtsEngineService.VOICES) {
-                addView(
-                    MaterialButton(this@MainActivity).apply {
-                        text = v.name.removePrefix("zh-CN-").removeSuffix("Neural")
-                        tag = v.name
-                        isChecked = v.name == saved
-                    }
-                )
+                val b = MaterialButton(this@MainActivity).apply {
+                    id = View.generateViewId()
+                    text = v.name.removePrefix("zh-CN-").removeSuffix("Neural")
+                    tag = v.name
+                }
+                if (v.name == saved) savedBtn = b
+                addView(b)
             }
             addOnButtonCheckedListener { _, checkedId, isChecked ->
                 if (isChecked) {
@@ -283,6 +285,13 @@ class MainActivity : AppCompatActivity() {
                     Settings.setVoice(this@MainActivity, b.tag as String)
                 }
             }
+            // The toggle GROUP owns its children's checked state, so the
+            // selection has to be applied here - after the buttons are attached.
+            // Setting isChecked on each button before addView() was silently
+            // dropped, which is why the saved voice never showed as selected
+            // (while Settings kept holding it, so audio used the old pick).
+            // Fall back to the first voice so exactly one is always visible.
+            (savedBtn ?: voiceToggle.getChildAt(0) as? MaterialButton)?.let { check(it.id) }
         }
         return card("Voice", voiceToggle)
     }
