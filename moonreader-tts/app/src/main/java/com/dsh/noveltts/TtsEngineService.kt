@@ -474,7 +474,16 @@ class TtsEngineService : TextToSpeechService() {
 
         // decode
         val tDecode = SystemClock.elapsedRealtime()
-        val decoded = AudioDecoder.decode(audio!!)
+        val decoded = try {
+            AudioDecoder.decode(audio!!)
+        } catch (e: Exception) {
+            // Never let a decode failure escape this thread: the framework would
+            // never receive done()/error(), and the client (Moon Reader) would
+            // hang on this utterance forever.
+            Log.e(TAG, "decode failed: ${e.message}")
+            try { callback.error() } catch (_: Exception) {}
+            return
+        }
         Log.i(TAG, "[perf] decode gen=$gen ms=${SystemClock.elapsedRealtime() - tDecode}")
         Log.i(TAG, "decoded: ${decoded.pcm.size / 2} samples, ${decoded.sampleRate}Hz, ${decoded.channels}ch (source=$source)")
         // Feed the framework at the audio's NATIVE rate (24 kHz) — no manual

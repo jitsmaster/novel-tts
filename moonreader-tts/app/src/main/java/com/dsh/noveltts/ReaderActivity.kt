@@ -141,6 +141,10 @@ class ReaderActivity : AppCompatActivity() {
     // reader to keep showing the old book).
     private val loadToken = java.util.concurrent.atomic.AtomicLong(0)
 
+    /** Set when the service reports an unrecoverable failure. Keeps the reason
+     * on screen instead of letting the position line overwrite it. */
+    private var errorShown = false
+
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             servicePlaying = intent.getBooleanExtra(AudioBookService.EXTRA_PLAYING, false)
@@ -151,6 +155,7 @@ class ReaderActivity : AppCompatActivity() {
             runOnUiThread {
                 when (reason) {
                     "block-start" -> {
+                        errorShown = false
                         blockIdx = block
                         renderBlockHighlight()
                         maybeSave()
@@ -167,6 +172,13 @@ class ReaderActivity : AppCompatActivity() {
                     "stopped" -> {
                         serviceLoaded = false
                         servicePlaying = false
+                    }
+                    "error" -> {
+                        errorShown = true
+                        statusView.text = "⚠ " + (
+                            intent.getStringExtra(AudioBookService.EXTRA_MESSAGE)
+                                ?: "获取音频失败"
+                        )
                     }
                 }
                 refreshPlayButton()
@@ -630,6 +642,8 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     private fun updatePosLine(pos: Long, dur: Long) {
+        // A failure message owns the status line until playback resumes.
+        if (errorShown) return
         val mm = pos / 60000; val ss = (pos % 60000) / 1000
         val dm = dur / 60000; val ds = (dur % 60000) / 1000
         val ch = chapter
@@ -652,6 +666,7 @@ class ReaderActivity : AppCompatActivity() {
         if (ch.blocks.isEmpty()) return
         autoAdvance = true
         serviceLoaded = true
+        errorShown = false
         // warm the audio cache for the whole chapter in the background
         prewarm(chapterIdx)
         val from = blockIdx.coerceIn(0, ch.blocks.size - 1)

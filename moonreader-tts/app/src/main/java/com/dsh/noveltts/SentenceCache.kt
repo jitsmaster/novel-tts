@@ -126,6 +126,18 @@ class SentenceCache(context: Context) : SQLiteOpenHelper(context, "tts_cache.db"
         }
     }
 
+    /** Drop a single entry. Used when stored bytes turn out to be
+     * undecodable, so the next attempt re-fetches instead of replaying the
+     * same bad blob forever. */
+    @Synchronized
+    fun remove(key: String) {
+        try {
+            writableDatabase.delete("cache", "key=?", arrayOf(key))
+        } catch (e: Exception) {
+            Log.w(TAG, "remove failed: ${e.message}")
+        }
+    }
+
     @Synchronized
     fun clear() {
         val db = writableDatabase

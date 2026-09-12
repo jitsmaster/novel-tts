@@ -65,7 +65,16 @@ class AudioBookService : Service() {
         const val EXTRA_BLOCK = "block"
         const val EXTRA_POS = "posMs"
         const val EXTRA_DUR = "durMs"
-        const val EXTRA_REASON = "reason"   // block-start | done | pause | play | seek | stopped | finished
+        const val EXTRA_REASON = "reason"   // block-start | done | pause | play | seek | stopped | finished | error
+        const val EXTRA_MESSAGE = "message" // human-readable detail for reason=error
+
+        /** Server fetch attempts before giving up. The previous version retried
+         * forever, so an unreachable server (phone's Tailscale tunnel down)
+         * meant silent retries with no audio and no error — indistinguishable
+         * from a hung TTS server. */
+        private const val FETCH_ATTEMPTS = 3
+        private const val RETRY_DELAY_MS = 800L
+        private const val RETRY_STEP_MS = 50L
 
         /** Routed by MediaButtonReceiver to whichever player is active. */
         @Volatile
@@ -273,7 +282,7 @@ class AudioBookService : Service() {
                     val myGen2 = myGen
                     Thread({
                         if (gen.get() == myGen2 && !stopRequested.get()) {
-                            try { obtainPcm(blocks[nextIdx], myGen2) } catch (_: Exception) {}
+                            try { obtainPcm(blocks[nextIdx], myGen2, quiet = true) } catch (_: Exception) {}
                         }
                     }, "novel-prefetch").apply { isDaemon = true }.start()
                 }
@@ -370,34 +379,90 @@ class AudioBookService : Service() {
         broadcastState("pause")
     }
 
-    private fun obtainPcm(text: String, myGen: Long): ByteArray? {
-        val key = SentenceCache.key(
-            Settings.voice(this).takeIf { it.isNotBlank() } ?: "zh-CN-YunxiNeural",
-            "+0%", "+0Hz", text
-        )
+    /**
+     * Fetch (or reuse cached) audio for [text] and decode it to stereo 16-bit PCM.
+     *
+     * [quiet] suppresses user-visible failure reporting; the look-ahead
+     * pre-fetch thread passes it so a failure there cannot disturb the block
+     * that is playing right now.
+     *
+     * Fetching is bounded by [FETCH_ATTEMPTS]. It used to recurse on every
+     * failure with no cap, so an unreachable server (e.g. the phone's Tailscale
+     * tunnel down) meant silent retries forever: no audio, no error, which
+     * looks exactly like a hung TTS server.
+     */
+    private fun obtainPcm(
+        text: String,
+        myGen: Long,
+        quiet: Boolean = false,
+        attempt: Int = 1,
+    ): ByteArray? {
+        // The SAME voice must be used for the cache key and for synthesis.
+        // This used to hash Settings.voice() into the key but synthesize with a
+        // hardcoded "zh-CN-YunxiNeural", so picking another voice changed
+        // nothing in the reader (and the key lied about the audio's voice).
+        val voice = Settings.voice(this).takeIf { it.isNotBlank() } ?: "zh-CN-YunxiNeural"
+        val key = SentenceCache.key(voice, "+0%", "+0Hz", text)
         var audio = cache().get(key)
         if (audio == null && !TtsEngineService.forceServerOnly) {
             try {
-                audio = EdgeTtsClient.synthesize(text, "zh-CN-YunxiNeural", "+0%", "+0Hz")
+                audio = EdgeTtsClient.synthesize(text, voice, "+0%", "+0Hz")
             } catch (_: Exception) {}
         }
         if (audio == null) {
             try {
-                val (body, _) = ServerTtsClient.synthesize(text, "zh-CN-YunxiNeural", "+0%", "+0Hz")
+                val (body, _) = ServerTtsClient.synthesize(text, voice, "+0%", "+0Hz")
                 audio = body
             } catch (e: Exception) {
-                Log.e(TAG, "fetch failed: ${e.message}")
-                Thread.sleep(800)
-                if (gen.get() != myGen) return null
-                return obtainPcm(text, myGen)
+                Log.e(TAG, "fetch failed (attempt $attempt/$FETCH_ATTEMPTS): ${e.message}")
+                if (gen.get() != myGen || stopRequested.get()) return null
+                if (attempt >= FETCH_ATTEMPTS) {
+                    reportFetchFailure(e, quiet)
+                    return null
+                }
+                // Interruptible backoff: a stop must not have to wait it out.
+                var waited = 0L
+                while (waited < RETRY_DELAY_MS && gen.get() == myGen && !stopRequested.get()) {
+                    Thread.sleep(RETRY_STEP_MS)
+                    waited += RETRY_STEP_MS
+                }
+                if (gen.get() != myGen || stopRequested.get()) return null
+                return obtainPcm(text, myGen, quiet, attempt + 1)
             }
         }
         cache().put(key, audio)
-        val decoded = AudioDecoder.decode(audio)
+        val decoded = try {
+            AudioDecoder.decode(audio)
+        } catch (e: Exception) {
+            // Don't keep replaying bytes we cannot decode: drop them so the
+            // next attempt re-fetches instead.
+            Log.e(TAG, "decode failed: ${e.message}")
+            try { cache().remove(key) } catch (_: Exception) {}
+            if (!quiet) reportFailure("音频解码失败 / decode failed: ${e.message}")
+            return null
+        }
         curSampleRate = decoded.sampleRate
         val shorts = pcmToShorts(decoded.pcm)
         val stereo = if (decoded.channels >= 2) shorts else upmix(shorts)
         return toBytes(stereo)
+    }
+
+    /** Surface an unrecoverable server failure (notification + reader UI). */
+    private fun reportFetchFailure(e: Exception, quiet: Boolean) {
+        val hint = if (TtsEngineService.forceServerOnly) {
+            "服务器不可达，请检查 Tailscale / 服务器地址"
+        } else {
+            "Edge 与本地服务器均不可用"
+        }
+        Log.e(TAG, "giving up after $FETCH_ATTEMPTS attempts: $hint (${e.message})")
+        if (!quiet) reportFailure("$hint（${e.message ?: "unknown"}）")
+    }
+
+    private fun reportFailure(message: String) {
+        try {
+            mainHandler.post { updateNotification("⚠ $message") }
+            broadcastState("error", message)
+        } catch (_: Exception) {}
     }
 
     private var _cache: SentenceCache? = null
@@ -703,18 +768,18 @@ class AudioBookService : Service() {
 
     // ---- activity communication -------------------------------------------
 
-    private fun broadcastState(reason: String) {
+    private fun broadcastState(reason: String, message: String? = null) {
         updateMediaState()
         try {
-            sendBroadcast(
-                Intent(ACTION_STATE)
-                    .setPackage(packageName)
-                    .putExtra(EXTRA_PLAYING, playing.get() && !pauseRequested.get())
-                    .putExtra(EXTRA_BLOCK, blockIndex)
-                    .putExtra(EXTRA_POS, currentChapterPosMs())
-                    .putExtra(EXTRA_DUR, chapterTotalMs())
-                    .putExtra(EXTRA_REASON, reason)
-            )
+            val i = Intent(ACTION_STATE)
+                .setPackage(packageName)
+                .putExtra(EXTRA_PLAYING, playing.get() && !pauseRequested.get())
+                .putExtra(EXTRA_BLOCK, blockIndex)
+                .putExtra(EXTRA_POS, currentChapterPosMs())
+                .putExtra(EXTRA_DUR, chapterTotalMs())
+                .putExtra(EXTRA_REASON, reason)
+            if (message != null) i.putExtra(EXTRA_MESSAGE, message)
+            sendBroadcast(i)
         } catch (_: Exception) {}
     }
 }
