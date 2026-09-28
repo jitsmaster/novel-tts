@@ -69,71 +69,112 @@ def _bump(key: str) -> None:
     except KeyError:
         _stats[key] = 1
 
-# Edge voice -> Kokoro voice mapping (names mirror each other).
-VOICE_MAP = {
-    "zh-CN-YunxiNeural": "zm_yunxi",     # young lively male
-    "zh-CN-YunjianNeural": "zm_yunjian", # deep documentary male
-    "zh-CN-XiaobeiNeural": "zf_xiaobei", # mature female
-    "zh-CN-XiaoxiaoNeural": "zf_xiaoxiao",
-    "zh-CN-YunyangNeural": "zm_yunyang",
-    "zh-CN-XiaoyiNeural": "zf_xiaoyi",
+# ---- Voice catalogue ---------------------------------------------------------
+#
+# WHICH ENGINE SPEAKS FOLLOWS THE VOICE NAME, so the LOCAL model is the default
+# and Edge is only ever used when an Edge voice is actually asked for:
+#
+#   zm_yunxi / zf_xiaobei / zf_001 / zm_010 …   local Kokoro   (no network)
+#   zh-CN-YunxiNeural / …                       Microsoft Edge (online)
+#   engine=kokoro|edge|auto                     per-request override
+#
+# Two things used to make the audio a mystery, both gone:
+#   * a missing local speaker was silently replaced by a same-gender one
+#     (asking for Xiaoxiao spoke Xiaobei), and
+#   * a Kokoro voice name was unknown, so it fell through to the DEFAULT
+#     speaker - every new voice name spoke Yunxi.
+# Every Chinese speaker of both Kokoro repos is now downloaded, and an unknown
+# name is reported instead of being substituted.
+
+# Edge (online) voices and the local speaker each one mirrors.
+EDGE_TO_KOKORO = {
+    "zh-CN-YunxiNeural": "zm_yunxi",      # young lively male
+    "zh-CN-YunjianNeural": "zm_yunjian",  # deep documentary male
+    "zh-CN-YunxiaNeural": "zm_yunxia",    # boyish male
+    "zh-CN-YunyangNeural": "zm_yunyang",  # news-anchor male
+    "zh-CN-XiaobeiNeural": "zf_xiaobei",  # mature female
+    "zh-CN-XiaoxiaoNeural": "zf_xiaoxiao",# warm female
+    "zh-CN-XiaoyiNeural": "zf_xiaoyi",    # lively female
+    "zh-CN-XiaoniNeural": "zf_xiaoni",    # girlie female
 }
-DEFAULT_VOICE = "zh-CN-YunxiNeural"
+KOKORO_TO_EDGE = {v: k for k, v in EDGE_TO_KOKORO.items()}
 
-# Kokoro-82M ships only THREE zh speakers in the locally cached snapshot:
-#   zf_xiaobei, zm_yunjian, zm_yunxi
-# Asking it for any other voice makes it try to download that speaker from the
-# HuggingFace Hub, which raises under HF_HUB_OFFLINE=1 and surfaced as a bare
-# 500 "both backends failed" (three of the six names above died this way).
-# Edge honours all six, so the map keeps them - only the local fallback needs
-# a stand-in.
-KOKORO_VOICES = {"zf_xiaobei", "zm_yunjian", "zm_yunxi"}
+# Kokoro-82M: 8 Mandarin speakers (worth preferring - best trained).
+KOKORO_V1 = [
+    "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+    "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+]
+# Kokoro-82M-v1.1-zh: the 100 Mandarin speakers added on top of that model.
+KOKORO_V11 = [
+        "zf_001", "zf_002", "zf_003", "zf_004", "zf_005", "zf_006",
+        "zf_007", "zf_008", "zf_017", "zf_018", "zf_019", "zf_021",
+        "zf_022", "zf_023", "zf_024", "zf_026", "zf_027", "zf_028",
+        "zf_032", "zf_036", "zf_038", "zf_039", "zf_040", "zf_042",
+        "zf_043", "zf_044", "zf_046", "zf_047", "zf_048", "zf_049",
+        "zf_051", "zf_059", "zf_060", "zf_067", "zf_070", "zf_071",
+        "zf_072", "zf_073", "zf_074", "zf_075", "zf_076", "zf_077",
+        "zf_078", "zf_079", "zf_083", "zf_084", "zf_085", "zf_086",
+        "zf_087", "zf_088", "zf_090", "zf_092", "zf_093", "zf_094",
+        "zf_099", "zm_009", "zm_010", "zm_011", "zm_012", "zm_013",
+        "zm_014", "zm_015", "zm_016", "zm_020", "zm_025", "zm_029",
+        "zm_030", "zm_031", "zm_033", "zm_034", "zm_035", "zm_037",
+        "zm_041", "zm_045", "zm_050", "zm_052", "zm_053", "zm_054",
+        "zm_055", "zm_056", "zm_057", "zm_058", "zm_061", "zm_062",
+        "zm_063", "zm_064", "zm_065", "zm_066", "zm_068", "zm_069",
+        "zm_080", "zm_081", "zm_082", "zm_089", "zm_091", "zm_095",
+        "zm_096", "zm_097", "zm_098", "zm_100",
+]
+KOKORO_REPO_V1 = "hexgrad/Kokoro-82M"
+KOKORO_REPO_V11 = "hexgrad/Kokoro-82M-v1.1-zh"
+KOKORO_REPO = {v: KOKORO_REPO_V1 for v in KOKORO_V1}
+KOKORO_REPO.update({v: KOKORO_REPO_V11 for v in KOKORO_V11})
 
-# Same-gender stand-in for requested voices the local model has no speaker for.
-KOKORO_SUBSTITUTE = {
-    "zf_xiaoxiao": "zf_xiaobei",
-    "zf_xiaoyi": "zf_xiaobei",
-    "zm_yunyang": "zm_yunjian",
-}
+# Local model first: this is what "use the TTS server" means on the phone.
+DEFAULT_VOICE = "zm_yunxi"
 
-
-def resolve_kokoro_voice(edge_voice: str) -> tuple:
-    """Map an Edge voice name to a Kokoro voice that actually exists locally.
-
-    Returns (kokoro_voice, substituted_from): substituted_from is the voice that
-    was asked for when a stand-in had to be used, else None."""
-    wanted = VOICE_MAP.get(edge_voice, VOICE_MAP[DEFAULT_VOICE])
-    if wanted in KOKORO_VOICES:
-        return wanted, None
-    return KOKORO_SUBSTITUTE.get(wanted, VOICE_MAP[DEFAULT_VOICE]), wanted
+KOKORO_WAV = "audio/wav"
+EDGE_MP3 = "audio/mpeg"
 
 app = FastAPI(title="DSH Novel TTS", version="1.0.0")
 
-_pipeline = None
+_pipelines = {}
 import threading
 _pipeline_lock = threading.Lock()
 
 # ---- Kokoro helpers ---------------------------------------------------------
 
-def _get_pipeline():
-    global _pipeline
-    if _pipeline is None:
+def _get_pipeline(repo_id: str):
+    """One KPipeline per model repo (v1.0 and v1.1-zh are separate checkpoints)."""
+    pipe = _pipelines.get(repo_id)
+    if pipe is None:
         with _pipeline_lock:
-            if _pipeline is None:
+            pipe = _pipelines.get(repo_id)
+            if pipe is None:
                 from kokoro import KPipeline
-                _pipeline = KPipeline(lang_code="z")
-    return _pipeline
+                pipe = KPipeline(lang_code="z", repo_id=repo_id)
+                _pipelines[repo_id] = pipe
+    return pipe
+
+
+def kokoro_voice_name(voice: str) -> str:
+    """The local speaker for [voice], or "" when this server has no such voice."""
+    if voice in KOKORO_REPO:
+        return voice
+    return EDGE_TO_KOKORO.get(voice, "")
 
 
 def kokoro_synthesize(text: str, voice: str, rate_pct: int = 0) -> bytes:
     """Synthesize with Kokoro, return WAV bytes (24 kHz mono 16-bit)."""
-    pipe = _get_pipeline()
+    speaker = kokoro_voice_name(voice)
+    if not speaker:
+        raise ValueError(f"no local Kokoro speaker for '{voice}'")
+    pipe = _get_pipeline(KOKORO_REPO[speaker])
     # Edge rate "+X%" -> speed multiplier. Edge rate is in percent of nominal
     # speed; positive = faster. Kokoro speed=1.0 is nominal.
     speed = 1.0 + rate_pct / 100.0
     speed = max(0.5, min(2.0, speed))
     chunks = []
-    for result in pipe(text, voice=voice, speed=speed):
+    for result in pipe(text, voice=speaker, speed=speed):
         chunks.append(result.audio)
     if not chunks:
         raise RuntimeError("Kokoro produced no audio")
@@ -142,7 +183,6 @@ def kokoro_synthesize(text: str, voice: str, rate_pct: int = 0) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return buf.getvalue()
-
 
 # ---- Edge helpers -----------------------------------------------------------
 
@@ -232,9 +272,12 @@ def _cache_put(key: str, ext: str, data: bytes) -> None:
 async def health():
     return {
         "status": "ok",
-        "kokoro": _pipeline is not None,
+        "kokoro": "available",
+        "kokoro_models_loaded": sorted(_pipelines),
+        "kokoro_voices": len(KOKORO_V1) + len(KOKORO_V11),
         "edge": "available",
-        "voices": VOICE_MAP,
+        "default_voice": DEFAULT_VOICE,
+        "default_engine": "kokoro",
         "sample_rate": SAMPLE_RATE,
         "cache_dir": CACHE_DIR,
         "timeouts": {
@@ -249,29 +292,36 @@ async def health():
 
 @app.get("/voices")
 async def voices():
-    """Voice routing per tier: Edge honours every name in edge_to_kokoro; the
-    Kokoro fallback only has kokoro_available, and substitutes for the rest."""
+    """The full voice catalogue: local Kokoro speakers first (the default
+    engine), Edge voices second (only used when one of these names is asked
+    for, or when engine=edge)."""
     return {
-        "edge_to_kokoro": VOICE_MAP,
-        "kokoro_available": sorted(KOKORO_VOICES),
-        "kokoro_substitutes": KOKORO_SUBSTITUTE,
         "default": DEFAULT_VOICE,
+        "default_engine": "kokoro",
+        "kokoro": {
+            "repo_v1": KOKORO_REPO_V1,
+            "repo_v11_zh": KOKORO_REPO_V11,
+            "voices_v1": list(KOKORO_V1),
+            "voices_v11_zh": list(KOKORO_V11),
+            "count": len(KOKORO_V1) + len(KOKORO_V11),
+        },
+        "edge": {
+            "voices": sorted(EDGE_TO_KOKORO),
+            "mirrors": EDGE_TO_KOKORO,
+        },
     }
 
 
 @app.get("/tts")
 async def tts(
     text: str = Query(..., description="Text to synthesize (one sentence)"),
-    voice: str = Query(DEFAULT_VOICE),
+    voice: str = Query(DEFAULT_VOICE, description="local Kokoro speaker (zm_yunxi, zf_001, …) or Edge voice (zh-CN-YunxiNeural)"),
     rate: str = Query("+0%"),
     pitch: str = Query("+0Hz"),
+    engine: str = Query("auto", description="auto | kokoro | edge"),
 ):
     if not text.strip():
         raise HTTPException(400, "empty text")
-    if voice not in VOICE_MAP:
-        # Allow any zh-CN Edge voice even if not pre-mapped; Kokoro fallback
-        # then uses the closest mapped voice or default.
-        pass
 
     # Edge rate/pitch must be SIGNED. A client that sends a bare "0%" / "0Hz"
     # (the Android engine did, until EdgeTtsClient.signedPct) makes edge-tts
@@ -280,9 +330,27 @@ async def tts(
     rate = _signed(rate, "%")
     pitch = _signed(pitch, "Hz")
 
-    key = _cache_key(text, voice, rate, pitch)
+    speaker = kokoro_voice_name(voice)      # "" = no such local speaker
+    edge_voice = voice if voice in EDGE_TO_KOKORO else ""
 
-    # 1) Cache
+    mode = (engine or "auto").strip().lower()
+    if mode not in ("auto", "kokoro", "edge"):
+        raise HTTPException(400, f"unknown engine '{engine}' (auto|kokoro|edge)")
+    if mode == "auto":
+        # LOCAL FIRST. Edge is used only when an Edge voice name was picked -
+        # never as a silent stand-in for a Kokoro voice, which is what made
+        # every sentence come from Edge no matter what was selected.
+        mode = "edge" if edge_voice else "kokoro"
+    if mode == "kokoro" and not speaker:
+        raise HTTPException(400, f"no local Kokoro speaker named '{voice}'")
+    if mode == "edge" and not edge_voice:
+        raise HTTPException(
+            400, f"'{voice}' is a local Kokoro voice; pick a zh-CN-* Edge voice or engine=kokoro"
+        )
+
+    # The engine is part of the key: the same voice can legitimately be spoken
+    # by the local model and by Edge, and those are different audio.
+    key = _cache_key(f"{voice}|{mode}", rate, pitch, text)
     cached, media = _cache_get(key)
     if cached:
         _bump("cache_hit")
@@ -290,38 +358,52 @@ async def tts(
 
     loop = asyncio.get_running_loop()
 
-    # 2) Edge TTS, on its own bounded pool (see the pools section at the top).
-    try:
-        data = await asyncio.wait_for(
-            loop.run_in_executor(_edge_pool, edge_synthesize, text, voice, rate, pitch),
-            timeout=EDGE_HANDLER_TIMEOUT,
-        )
-        _cache_put(key, "mp3", data)
-        _bump("edge_ok")
-        return Response(content=data, media_type="audio/mpeg")
-    except Exception as e:  # throttled / timeout / broken -> local fallback
-        # Never silent: an invisible fallback made a merely degraded Edge
-        # indistinguishable from a broken server.
-        _bump("edge_fail")
-        print(f"[tts] edge failed ({type(e).__name__}: {e}); falling back to kokoro", flush=True)
+    if mode == "kokoro":
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(
+                    _kokoro_pool, kokoro_synthesize, text, voice, _edge_rate_to_pct(rate)
+                ),
+                timeout=KOKORO_TIMEOUT,
+            )
+            _cache_put(key, "wav", data)
+            _bump("kokoro_ok")
+            return Response(content=data, media_type=KOKORO_WAV)
+        except Exception as e:
+            _bump("kokoro_fail")
+            print(f"[tts] kokoro failed for '{voice}' ({type(e).__name__}: {e})", flush=True)
+            # Only a mirrored voice has somewhere else to go; anything else is
+            # reported instead of silently speaking a different voice.
+            if not edge_voice:
+                raise HTTPException(500, f"kokoro failed: {e}")
+            print(f"[tts] falling back to Edge '{edge_voice}' to keep reading alive",
+                  flush=True)
+    else:
+        # Edge TTS on its own bounded pool (see the pools section at the top).
+        try:
+            data = await asyncio.wait_for(
+                loop.run_in_executor(_edge_pool, edge_synthesize, text, edge_voice, rate, pitch),
+                timeout=EDGE_HANDLER_TIMEOUT,
+            )
+            _cache_put(key, "mp3", data)
+            _bump("edge_ok")
+            return Response(content=data, media_type=EDGE_MP3)
+        except Exception as e:
+            _bump("edge_fail")
+            print(f"[tts] edge failed ({type(e).__name__}: {e}); falling back to kokoro",
+                  flush=True)
 
-    # 3) Kokoro local fallback
-    kokoro_voice, substituted = resolve_kokoro_voice(voice)
-    if substituted:
-        print(
-            f"[tts] no local Kokoro speaker for '{substituted}'; using '{kokoro_voice}'",
-            flush=True,
-        )
+    # Last resort: the local model (Edge voice -> its mirrored speaker).
     try:
         data = await asyncio.wait_for(
             loop.run_in_executor(
-                _kokoro_pool, kokoro_synthesize, text, kokoro_voice, _edge_rate_to_pct(rate)
+                _kokoro_pool, kokoro_synthesize, text, edge_voice or voice, _edge_rate_to_pct(rate)
             ),
             timeout=KOKORO_TIMEOUT,
         )
         _cache_put(key, "wav", data)
         _bump("kokoro_ok")
-        return Response(content=data, media_type="audio/wav")
+        return Response(content=data, media_type=KOKORO_WAV)
     except Exception as e:
         _bump("kokoro_fail")
         print(f"[tts] kokoro failed ({type(e).__name__}: {e})", flush=True)
@@ -337,10 +419,14 @@ async def startup():
     import threading as _threading
 
     def _warm():
-        try:
-            _get_pipeline()
-            print("[startup] Kokoro pipeline loaded", flush=True)
-        except Exception as e:
-            print(f"[startup] Kokoro warmup failed (will retry lazily): {e}", flush=True)
+        # Warm BOTH checkpoints: v1.0 (the 8 well-trained speakers) is the
+        # default target, v1.1-zh serves the 100 extra voices.
+        for repo in (KOKORO_REPO_V1, KOKORO_REPO_V11):
+            try:
+                _get_pipeline(repo)
+                print(f"[startup] Kokoro pipeline loaded: {repo}", flush=True)
+            except Exception as e:
+                print(f"[startup] Kokoro warmup failed for {repo} (retried lazily): {e}",
+                      flush=True)
 
     _threading.Thread(target=_warm, daemon=True).start()
