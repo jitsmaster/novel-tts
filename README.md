@@ -2,20 +2,38 @@
 
 Self-hosted Chinese TTS for reading novels in Moon Reader on Android.
 
-## Architecture (fully automatic cascade, no config switches)
+## Architecture (fully automatic service tiers, no config switches)
 
 ```
-Moon Reader
-   └─ Android TTS engine (com.dsh.noveltts, this repo's app/)
-        ├─ 1. SQLite sentence cache        (instant replay, no network)
-        ├─ 2. Edge TTS, direct from phone  (free, best quality; wss://speech.platform.bing.com)
-        └─ 3. DSH TTS server on the Mac    (http://100.85.43.11:8321)
-              └─ server itself cascades: Edge TTS → Kokoro-82M (local, offline)
+Moon Reader (or the built-in reader)
+   └─ Android TTS engine (com.dsh.noveltts, app/)
+        ├─ 0. SQLite sentence cache        (instant replay, no network)
+        └─ TtsRouter tiers, in priority order:
+             1. DSH TTS server on the Mac (http://100.85.43.11:8321)   ← preferred
+                  └─ the server itself cascades: Edge TTS → Kokoro-82M (local, offline)
+             2. Edge TTS, direct from the phone (wss://speech.platform.bing.com)
+             3. Google TTS on the device (com.google.android.tts)      ← last resort
 ```
 
-If Edge is throttled or broken, the engine automatically falls through to the
-server tier, and the server automatically falls back to the local Kokoro model —
-**no code or config change required** (verified on emulator: `[cache]`/`[edge]`/`[server]`).
+Rules (`TtsRouter` — the single place that picks a backend for LIVE playback,
+pre-render and the standalone reader alike):
+
+- **3 consecutive server failures → switch to Edge. 5 consecutive Edge failures →
+  switch to the Google TTS engine.** A failure counter is reset by any success of
+  the current tier.
+- A single request never goes silent: it walks down the remaining tiers, so the
+  sentence still plays while the current tier's failure counter accumulates.
+- **Recovery pings**: while Edge is in use the server is pinged every 10 minutes;
+  while Google is in use Edge is pinged every 5 minutes. A successful ping switches
+  back up (Google → Edge, then Edge → server), so the chain walks all the way back
+  to the preferred server on its own.
+- **Manual override**: the app's “语音服务” card and the reader's service line show
+  the tier in use and let the user pick one. A manual pick becomes the new tier and
+  the same rules apply from there; “lock” freezes the pick (no switching, no pings).
+  The choice is persisted across restarts.
+- Verified end-to-end on the emulator (AVD `tts_test`): server→Edge at 3 failures,
+  Edge→Google at 5, both recovery walks, manual pick + lock, and the reader /
+  pre-render paths (`source=server|edge|google|cache`).
 
 ## Server (Mac mini, M4)
 
@@ -58,6 +76,14 @@ server tier, and the server automatically falls back to the local Kokoro model �
     Reader never advances (no missed content on resume).
 - `EdgeTtsClient` — faithful Kotlin port of the edge-tts protocol (Sec-MS-GEC Long math,
   WSS + SSML, binary frame parse `[2-byte len][headers][\r\n\r\n][mp3]`), validated live.
+- `TtsRouter` — the tier state machine (see Architecture): priority, failure
+  thresholds, recovery pings, manual pick / lock, and the persisted choice. Every
+  audio path (engine, reader, pre-render) fetches through it, so there is exactly
+  one definition of "which service is in use".
+- `GoogleTtsClient` — last-resort tier. Renders with the device's own engine
+  (`com.google.android.tts`, else the system default when it is not this app, else
+  Pico) via `synthesizeToFile`, so the audio enters the SAME decode → cache →
+  playback path as the other tiers and keeps pause/stop/audio-focus behaviour.
 - **Why there is no in-engine prefetch queue**: Android's TTS framework delivers one
   utterance at a time (`TextToSpeechService.SynthHandler` serializes them on one
   synthesis thread and auto-completes an utterance the moment `onSynthesizeText`
@@ -69,18 +95,25 @@ server tier, and the server automatically falls back to the local Kokoro model �
   layer that can: it owns the source text). Paste a passage (or `adb shell am
   start -n com.dsh.noveltts/.MainActivity -a com.dsh.noveltts.PRERENDER --ei
   sampleCount 120`) and it renders each sentence into the phone sentence cache
-  through the same cascade + keys as live playback, so a later Moon Reader pass
+  through the same tier rules + keys as live playback, so a later Moon Reader pass
   over the same text is served from cache (measured: 613 ms → 13 ms fetch per
   sentence). Moon Reader compatibility caveat: cache keys are byte-exact
   `voice|rate|pitch|text`, so pre-rendered text must match Moon Reader's
   utterance strings byte-for-byte (same source text incl. leading indents).
   Moon Reader chunks one 。！？-terminated sentence per utterance.
 - MainActivity — settings + diagnostics: bundled 三國志演義 excerpt (3088
-  sentences), per-sentence latency, rate/pitch sliders, voice spinner, "force
-  server only" checkbox to exercise the Kokoro tier, sentence-cache size/clear,
-  Pre-render card, editable server URL. Test hooks via intent extras:
-  `--ez autoplay true --ei limit N` (play first N sample sentences) and
-  `-a com.dsh.noveltts.CLEAR_CACHE`.
+  sentences), per-sentence latency, rate/pitch sliders, voice spinner,
+  sentence-cache size/clear, Pre-render card, editable server URL, and the
+  **语音服务 card**: the tier in use right now, why it switched, the failure
+  counter, the next ping, manual tier buttons (服务器 / Edge / Google), a lock
+  switch and an "立即探测" button. Test hooks via intent extras:
+  `--ez autoplay true --ei limit N` (play first N sample sentences),
+  `-a com.dsh.noveltts.CLEAR_CACHE`, `-a com.dsh.noveltts.STATUS` (dump the tier
+  state to logcat as `TIER|`), `--es tier <server|edge|google> --ez pin <bool>`,
+  `--ei probeSeconds N` (shorten the recovery ping — test only), `--ez probeNow true`.
+- **Tier regression test**: `python3 moonreader-tts/tier_emulator_test.py` (AVD
+  `tts_test` booted, debug APK installed) drives all five rules + both recovery
+  walks + the UI over adb and asserts on logcat. Last run: 19/19 checks passed.
 - **Library bookshelf**: 📂 in the reader opens your books folder (picked
   once via the system folder picker, defaulting to /sdcard/Books where Moon
   Reader keeps novels) and lists every .txt/.epub as a tappable row — no more
