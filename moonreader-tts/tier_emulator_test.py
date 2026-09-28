@@ -138,6 +138,31 @@ def scroll_to_voice_card():
     time.sleep(2)
 
 
+def scroll_to_top(times=6):
+    """The settings ScrollView keeps its position between launches, so every UI
+    check starts from a known place instead of wherever the last test left it."""
+    for _ in range(times):
+        shell("input swipe 540 600 540 2000")
+        time.sleep(0.3)
+
+
+def scan_page(needle=None, steps=10, gap=1200):
+    """Scroll down the settings page, returning every dump seen (concatenated).
+
+    Stops early when [needle] shows up, so a check can assert "eventually
+    visible" without knowing how long the page is.
+    """
+    seen = ""
+    for _ in range(steps):
+        xml = dump_ui()
+        seen += xml
+        if needle and needle in seen:
+            return seen
+        shell("input swipe 540 1900 540 %d" % (1900 - gap))
+        time.sleep(0.8)
+    return seen
+
+
 def radio_checked(xml, label):
     """True when a RadioButton whose text contains [label] is checked."""
     for node in re.findall(r"<node[^>]*>", xml):
@@ -251,16 +276,11 @@ xml = dump_ui("/sdcard/m.xml")
 ui_ok = ("当前服务：" in xml and "服务器" in xml and "Edge" in xml and "Google" in xml
          and "锁定当前服务" in xml and "立即探测" in xml)
 check("T7 settings card shows the current service + manual tier buttons + lock", ui_ok)
-# The rules paragraph sits below the tier radios, so it is only in the dump
-# once the card has been scrolled into view.
-for _ in range(4):
-    if "连续失败 3 次转 Edge" in xml and "每 10 分钟探测服务器" in xml:
-        break
-    shell("input swipe 540 1900 540 1300")
-    time.sleep(1)
-    xml = dump_ui()
+# The rules paragraph sits below the tier radios: scroll it into view.
+scroll_to_top()
+card = scan_page(needle="每 10 分钟探测服务器")
 check("T7b card explains the automatic rules",
-      "连续失败 3 次转 Edge" in xml and "每 10 分钟探测服务器" in xml,
+      "连续失败 3 次转 Edge" in card and "每 10 分钟探测服务器" in card,
       "rules paragraph visible")
 check("T7c the current tier is visibly selected in the radio group",
       radio_checked(xml, "TTS 服务器"), "checked radio for TTS 服务器")
@@ -303,17 +323,15 @@ time.sleep(1)
 start(MAIN, "--es", "voice", "zh-CN-XiaobeiNeural", "--ez", "forceVoice", "true",
       "--es", "tier", "server", "--ez", "pin", "false")
 time.sleep(4)
-# The catalogue is long now, so scroll the radio into view instead of guessing.
-sel = False
-for _ in range(8):
-    xml = dump_ui()
-    if radio_checked(xml, "Xiaobei 女声·成熟 · Edge"):
-        sel = True
-        break
-    shell("input swipe 540 1900 540 1200")
-    time.sleep(1)
-check("V3 the voice radio group shows the saved Edge voice as selected", sel,
-      "Edge Xiaobei radio checked" if sel else "no checked Edge Xiaobei radio in the dump")
+# The catalogue is long now: scan the whole card. (Not an early-stop scan: the
+# "当前语音：…" line repeats the label, so a text match would stop on the summary
+# line before the radio itself is on screen.)
+scroll_to_top()
+seen = scan_page()
+check("V3 the voice radio group shows the saved Edge voice as selected",
+      radio_checked(seen, "Xiaobei 女声·成熟 · Edge"),
+      "Edge Xiaobei radio checked" if radio_checked(seen, "Xiaobei 女声·成熟 · Edge")
+      else "no checked Edge Xiaobei radio in the dump")
 
 # ------------------------------- V4/V5: the ENGINE follows the voice NAME
 # The server speaks its own Kokoro model by default; Edge is used only when an
@@ -341,20 +359,16 @@ time.sleep(1)
 start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true",
       "--es", "tier", "server", "--ez", "pin", "false")
 time.sleep(4)
-sel = False
-for _ in range(8):
-    xml = dump_ui()
-    if radio_checked(xml, "Xiaobei 女声·成熟 · 本地"):
-        sel = True
-        break
-    shell("input swipe 540 1900 540 1200")
-    time.sleep(1)
-check("V5 the LOCAL Xiaobei radio is checked (not the Edge one)", sel,
-      "local Xiaobei radio checked" if sel else "no checked local Xiaobei radio")
+# Scan the whole Voice card once: the checked radio AND all three sections.
+scroll_to_top()
+card = scan_page()
+local_sel = radio_checked(card, "Xiaobei 女声·成熟 · 本地")
+missing = [s for s in ("本地 Kokoro v1.0（8）", "本地 Kokoro v1.1-zh（100）", "Edge 在线（8）")
+           if s not in card]
+check("V5 the LOCAL Xiaobei radio is checked (not the Edge one)", local_sel,
+      "local Xiaobei radio checked" if local_sel else "no checked local Xiaobei radio")
 check("V5b the picker offers the full catalogue (Kokoro v1.0 / v1.1-zh / Edge)",
-      "本地 Kokoro v1.0（8）" in xml and "本地 Kokoro v1.1-zh（100）" in xml
-      and "Edge 在线（8）" in xml,
-      "sections found" if "本地 Kokoro v1.1-zh（100）" in xml else "sections missing")
+      not missing, "all three sections found" if not missing else "missing: %s" % missing)
 
 # cleanup / restore the app to its normal state on this emulator
 config_only(server=PHONE_DEFAULT, tier="server", pin=False)
