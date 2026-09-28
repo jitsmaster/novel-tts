@@ -197,7 +197,7 @@ object TtsRouter {
             // fail outright and drop the sentence to Google. Use the Edge voice
             // with the same persona instead - this is the resilience path (the
             // server already failed 3 times), not a switch away from local.
-            val edgeVoice = Voices.LOCAL_TO_EDGE[voice]
+            val edgeVoice = Voices.edgeStandIn(voice)
             if (edgeVoice != null) Log.i(TAG, "Edge stands in for local voice $voice -> $edgeVoice")
             EdgeTtsClient.synthesize(text, edgeVoice ?: voice, ratePct, pitchHz)
         }
@@ -383,7 +383,7 @@ object TtsRouter {
         Tier.EDGE -> {
             // Same mapping as attempt(): a local voice name would make the ping
             // fail and the chain would never walk back up to Edge.
-            val v = Voices.LOCAL_TO_EDGE[Settings.voice(c)] ?: Settings.voice(c)
+            val v = Voices.edgeStandIn(Settings.voice(c)) ?: Settings.voice(c)
             EdgeTtsClient.synthesize("你好", v, "+0%", "+0Hz", 8000L)
             true
         }

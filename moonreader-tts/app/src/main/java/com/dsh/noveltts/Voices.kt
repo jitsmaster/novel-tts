@@ -26,6 +26,10 @@ object Voices {
     /** Default voice: a local speaker, never Edge. */
     const val DEFAULT = "zm_yunxi"
 
+    /** Edge voices used when a local speaker has no Edge twin (server offline). */
+    const val EDGE_FEMALE_STAND_IN = "zh-CN-XiaoniNeural"
+    const val EDGE_MALE_STAND_IN = "zh-CN-YunjianNeural"
+
     /**
      * @param name  what the engine (and the server) is asked for
      * @param label what the user sees
@@ -197,6 +201,24 @@ object Voices {
     ).toMap()
     val LOCAL_TO_EDGE: Map<String, String> =
         EDGE_TO_LOCAL.entries.associate { (k, v) -> v to k }
+
+    /**
+     * Which Edge voice to speak when the server is offline.
+     *
+     * The eight v1.0 speakers have an Edge voice with the SAME persona, so they
+     * sound like themselves. The 100 v1.1-zh speakers were never recorded for
+     * Edge, so a fixed voice per gender stands in (zf_* -> Xiaoni, zm_* ->
+     * Yunjian) - far better than dropping the sentence to the phone's Google
+     * engine, which is what an unknown Edge name would cause.
+     *
+     * @return an Edge voice name, or null when nothing sensible can stand in
+     */
+    fun edgeStandIn(name: String): String? = when {
+        LOCAL_TO_EDGE[name] != null -> LOCAL_TO_EDGE[name]
+        name.startsWith("zf_") -> EDGE_FEMALE_STAND_IN
+        name.startsWith("zm_") -> EDGE_MALE_STAND_IN
+        else -> null
+    }
 
     /** The framework's view of the same list. */
     fun frameworkVoices(): List<Voice> = all.map { e ->
