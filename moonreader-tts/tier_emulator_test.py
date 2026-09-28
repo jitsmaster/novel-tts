@@ -251,8 +251,17 @@ xml = dump_ui("/sdcard/m.xml")
 ui_ok = ("当前服务：" in xml and "服务器" in xml and "Edge" in xml and "Google" in xml
          and "锁定当前服务" in xml and "立即探测" in xml)
 check("T7 settings card shows the current service + manual tier buttons + lock", ui_ok)
+# The rules paragraph sits below the tier radios, so it is only in the dump
+# once the card has been scrolled into view.
+for _ in range(4):
+    if "连续失败 3 次转 Edge" in xml and "每 10 分钟探测服务器" in xml:
+        break
+    shell("input swipe 540 1900 540 1300")
+    time.sleep(1)
+    xml = dump_ui()
 check("T7b card explains the automatic rules",
-      "连续失败 3 次转 Edge" in xml and "每 10 分钟探测服务器" in xml)
+      "连续失败 3 次转 Edge" in xml and "每 10 分钟探测服务器" in xml,
+      "rules paragraph visible")
 check("T7c the current tier is visibly selected in the radio group",
       radio_checked(xml, "TTS 服务器"), "checked radio for TTS 服务器")
 
@@ -291,16 +300,20 @@ check("V2 with the override off the client's own voice wins",
 
 stop()
 time.sleep(1)
-start(MAIN, "--es", "voice", "zh-CN-XiaobeiNeural", "--ez", "forceVoice", "true")
+start(MAIN, "--es", "voice", "zh-CN-XiaobeiNeural", "--ez", "forceVoice", "true",
+      "--es", "tier", "server", "--ez", "pin", "false")
 time.sleep(4)
-xml = dump_ui()
-sel = radio_checked(xml, "Xiaobei（成熟女声）")
-if not sel:                                    # below the fold: scroll it in
-    scroll_to_voice_card()
+# The catalogue is long now, so scroll the radio into view instead of guessing.
+sel = False
+for _ in range(8):
     xml = dump_ui()
-    sel = radio_checked(xml, "Xiaobei（成熟女声）")
-check("V3 the voice radio group shows the saved voice as selected", sel,
-      "Xiaobei radio checked" if sel else "no checked Xiaobei radio in the dump")
+    if radio_checked(xml, "Xiaobei 女声·成熟 · Edge"):
+        sel = True
+        break
+    shell("input swipe 540 1900 540 1200")
+    time.sleep(1)
+check("V3 the voice radio group shows the saved Edge voice as selected", sel,
+      "Edge Xiaobei radio checked" if sel else "no checked Edge Xiaobei radio in the dump")
 
 # ------------------------------- V4/V5: the ENGINE follows the voice NAME
 # The server speaks its own Kokoro model by default; Edge is used only when an
@@ -308,8 +321,11 @@ check("V3 the voice radio group shows the saved voice as selected", sel,
 # to come from Edge because the app only knew Edge names.
 stop()
 time.sleep(1)
+# T8 left the tier locked on Google; reset it or this measures the wrong tier.
+config_only(server=GOOD, tier="server", pin=False, clear=True)
 clear_log()
 start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true",
+      "--es", "tier", "server", "--ez", "pin", "false",
       "--ez", "autoplay", "true", "--ei", "limit", "1")
 time.sleep(22)
 vlog = logs("NovelTtsEngine", "NovelTtsRouter")
@@ -322,14 +338,17 @@ check("V4b the local voice is served without touching a phone-side tier",
 
 stop()
 time.sleep(1)
-start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true")
+start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true",
+      "--es", "tier", "server", "--ez", "pin", "false")
 time.sleep(4)
-xml = dump_ui()
-sel = radio_checked(xml, "Xiaobei 女声·成熟 · 本地")
-if not sel:
-    scroll_to_voice_card()
+sel = False
+for _ in range(8):
     xml = dump_ui()
-    sel = radio_checked(xml, "Xiaobei 女声·成熟 · 本地")
+    if radio_checked(xml, "Xiaobei 女声·成熟 · 本地"):
+        sel = True
+        break
+    shell("input swipe 540 1900 540 1200")
+    time.sleep(1)
 check("V5 the LOCAL Xiaobei radio is checked (not the Edge one)", sel,
       "local Xiaobei radio checked" if sel else "no checked local Xiaobei radio")
 check("V5b the picker offers the full catalogue (Kokoro v1.0 / v1.1-zh / Edge)",
