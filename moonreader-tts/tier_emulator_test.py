@@ -302,9 +302,44 @@ if not sel:                                    # below the fold: scroll it in
 check("V3 the voice radio group shows the saved voice as selected", sel,
       "Xiaobei radio checked" if sel else "no checked Xiaobei radio in the dump")
 
+# ------------------------------- V4/V5: the ENGINE follows the voice NAME
+# The server speaks its own Kokoro model by default; Edge is used only when an
+# Edge voice (zh-CN-*Neural) is picked on purpose. Regression: every voice used
+# to come from Edge because the app only knew Edge names.
+stop()
+time.sleep(1)
+clear_log()
+start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true",
+      "--ez", "autoplay", "true", "--ei", "limit", "1")
+time.sleep(22)
+vlog = logs("NovelTtsEngine", "NovelTtsRouter")
+check("V4 a local Kokoro voice is requested as such (server speaks it itself)",
+      "voice=zf_xiaobei" in vlog,
+      [l.split("NovelTtsEngine: ")[-1][:58] for l in vlog.splitlines() if "[perf] req" in l][:1])
+check("V4b the local voice is served without touching a phone-side tier",
+      "source=server" in vlog and "source=edge" not in vlog and "source=google" not in vlog,
+      [l.split("NovelTtsEngine: ")[-1][:58] for l in vlog.splitlines() if "[perf] fetch" in l][:1])
+
+stop()
+time.sleep(1)
+start(MAIN, "--es", "voice", "zf_xiaobei", "--ez", "forceVoice", "true")
+time.sleep(4)
+xml = dump_ui()
+sel = radio_checked(xml, "Xiaobei 女声·成熟 · 本地")
+if not sel:
+    scroll_to_voice_card()
+    xml = dump_ui()
+    sel = radio_checked(xml, "Xiaobei 女声·成熟 · 本地")
+check("V5 the LOCAL Xiaobei radio is checked (not the Edge one)", sel,
+      "local Xiaobei radio checked" if sel else "no checked local Xiaobei radio")
+check("V5b the picker offers the full catalogue (Kokoro v1.0 / v1.1-zh / Edge)",
+      "本地 Kokoro v1.0（8）" in xml and "本地 Kokoro v1.1-zh（100）" in xml
+      and "Edge 在线（8）" in xml,
+      "sections found" if "本地 Kokoro v1.1-zh（100）" in xml else "sections missing")
+
 # cleanup / restore the app to its normal state on this emulator
 config_only(server=PHONE_DEFAULT, tier="server", pin=False)
-shell("am start -n %s --es voice zh-CN-YunxiNeural --ez forceVoice true" % MAIN)
+shell("am start -n %s --es voice zm_yunxi --ez forceVoice true" % MAIN)
 time.sleep(3)
 stop()
 _unblock()
