@@ -242,6 +242,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Re-read every persisted choice when this screen comes back to the front.
+     *
+     * The reader (and Android's own TTS settings) can change the voice or the
+     * service while this activity sits in the background; the radio groups used
+     * to keep whatever state they were BUILT with, so the screen showed a
+     * selection that no longer matched the audio. The automatic tier rules can
+     * also switch service on their own while we are away.
+     */
+    override fun onResume() {
+        super.onResume()
+        if (!::voiceGroup.isInitialized) return
+        selectSavedVoice()                                  // voice radios
+        forceVoiceSwitch.isChecked = Settings.forceVoice(this)
+        refreshServiceCard()                                // service radios + lock
+        applyClientVoice()                                  // in-app client follows too
+        appendLog("=== resumed: voice=${Settings.voice(this)} " +
+            "tier=${TtsRouter.home.label} pinned=${TtsRouter.pinned}")
+    }
+
     private fun ready() {
         engine.language = Locale.SIMPLIFIED_CHINESE
         runOnUiThread {
@@ -536,6 +556,15 @@ class MainActivity : AppCompatActivity() {
                 val name = group.findViewById<MaterialRadioButton>(checkedId)?.tag as? String
                     ?: return@setOnCheckedChangeListener
                 Settings.setVoice(this@MainActivity, name)
+                // Tapping a voice means "I want to HEAR this one". With the
+                // override off the engine still followed whatever voice the
+                // reading client (Moon Reader) asked for, so the pick looked
+                // like it changed nothing at all.
+                if (!Settings.forceVoice(this@MainActivity)) {
+                    Settings.setForceVoice(this@MainActivity, true)
+                    forceVoiceSwitch.isChecked = true
+                    appendLog("=== voice override switched ON (a voice was picked)")
+                }
                 applyClientVoice()
                 appendLog("=== voice -> $name")
             }

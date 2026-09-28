@@ -382,44 +382,56 @@ class ReaderActivity : AppCompatActivity() {
             "） · 点击切换"
     }
 
-    /** Manual tier pick; the automatic rules stay armed afterwards. */
+    /**
+     * Manual service pick. A single-choice list, so the radio button next to
+     * the active service shows the selection state at a glance (the old plain
+     * list only prefixed the row with "✓", which was easy to miss).
+     * The automatic rules stay armed afterwards.
+     */
     private fun showTierDialog() {
         val tiers = TtsRouter.Tier.values()
-        val labels = tiers.map { (if (it == TtsRouter.home) "✓ " else "   ") + "${it.icon}  ${it.cn}" }
-            .toMutableList()
-        val voiceLabel = "🎙  语音：${Settings.voice(this).removePrefix("zh-CN-").removeSuffix("Neural")}"
-        val lockLabel = if (TtsRouter.pinned) "🔓  解除锁定（恢复自动切换）"
-                        else "🔒  锁定当前服务（不自动切换）"
-        labels.add(voiceLabel)
-        labels.add(lockLabel)
+        val labels = tiers.map { "${it.icon}  ${it.cn}" }.toTypedArray()
+        val current = tiers.indexOfFirst { it == TtsRouter.home }
         android.app.AlertDialog.Builder(this)
-            .setTitle("选择语音服务（当前：" + TtsRouter.home.cn + "）")
-            .setItems(labels.toTypedArray()) { _, which ->
-                when {
-                    which < tiers.size -> TtsRouter.select(this, tiers[which], pin = false)
-                    which == tiers.size -> showVoiceDialog()
-                    else -> if (TtsRouter.pinned) TtsRouter.unpin(this)
-                            else TtsRouter.select(this, TtsRouter.home, pin = true)
-                }
+            .setTitle("语音服务（当前：" + TtsRouter.home.cn + "）")
+            .setSingleChoiceItems(labels, current) { dialog, which ->
+                TtsRouter.select(this, tiers[which], pin = false)
+                refreshTierLine()
+                dialog.dismiss()
+            }
+            .setNeutralButton("🎙 语音…") { _, _ -> showVoiceDialog() }
+            .setPositiveButton(if (TtsRouter.pinned) "🔓 解除锁定" else "🔒 锁定") { _, _ ->
+                if (TtsRouter.pinned) TtsRouter.unpin(this)
+                else TtsRouter.select(this, TtsRouter.home, pin = true)
                 refreshTierLine()
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    /** Voice pick from the reader (same setting as the app's Voice card). */
+    /**
+     * Voice pick from the reader (same setting as the app's Voice card).
+     * Single-choice list again, and the pick also turns the app's "my voice
+     * wins" override on — otherwise the reading client keeps asking the engine
+     * for its own voice and the switch looks like it does nothing.
+     */
     private fun showVoiceDialog() {
         val voices = TtsEngineService.VOICES
         val saved = Settings.voice(this)
-        val labels = voices.map { (if (it.name == saved) "✓ " else "   ") +
-            it.name.removePrefix("zh-CN-").removeSuffix("Neural") }
+        val short = { name: String -> name.removePrefix("zh-CN-").removeSuffix("Neural") }
+        val labels = voices.map {
+            short(it.name) + (if (it.name == saved) "（当前）" else "")
+        }.toTypedArray()
+        val current = voices.indexOfFirst { it.name == saved }
         android.app.AlertDialog.Builder(this)
-            .setTitle("选择语音（当前：" + saved.removePrefix("zh-CN-").removeSuffix("Neural") + "）")
-            .setItems(labels.toTypedArray()) { _, which ->
+            .setTitle("选择语音（当前：" + short(saved) + "）")
+            .setSingleChoiceItems(labels, current) { dialog, which ->
                 Settings.setVoice(this, voices[which].name)
+                Settings.setForceVoice(this, true)
                 // The engine reads Settings on every utterance, so the next
                 // sentence already uses the new voice.
-                toast("语音已切换为 " + voices[which].name.removePrefix("zh-CN-").removeSuffix("Neural"))
+                toast("语音已切换为 " + short(voices[which].name))
+                dialog.dismiss()
             }
             .setNegativeButton("取消", null)
             .show()
