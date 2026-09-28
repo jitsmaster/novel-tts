@@ -22,7 +22,14 @@ object AudioDecoder {
     )
 
     fun decode(bytes: ByteArray): Result {
-        val tmp = File.createTempFile("tts_in", ".bin")
+        // Extension hint only: MediaExtractor sniffs the content, but a WAV
+        // payload (Kokoro server tier, Google TTS fallback tier) is recognized
+        // more reliably when the file name says so.
+        val suffix = if (bytes.size > 12 &&
+            bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte() &&
+            bytes[2] == 'F'.code.toByte() && bytes[3] == 'F'.code.toByte()
+        ) ".wav" else ".mp3"
+        val tmp = File.createTempFile("tts_in", suffix)
         try {
             tmp.writeBytes(bytes)
             return decodeFile(tmp)

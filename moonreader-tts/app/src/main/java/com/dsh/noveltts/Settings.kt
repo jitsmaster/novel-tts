@@ -15,6 +15,9 @@ object Settings {
     private const val KEY_PITCH = "pitch"      // float, 1.0 = normal
     private const val KEY_SERVER_URL = "server_url"
     private const val KEY_FORCE_SERVER = "force_server"
+    private const val KEY_TIER = "tier"              // TtsRouter.Tier name
+    private const val KEY_TIER_PINNED = "tier_pinned"
+    private const val KEY_FORCE_VOICE = "force_voice"
 
     const val DEFAULT_VOICE = "zh-CN-YunxiNeural"
     const val DEFAULT_SERVER_URL = "http://100.85.43.11:8321"
@@ -38,6 +41,16 @@ object Settings {
     fun setPitch(context: Context, p: Float) =
         prefs(context).edit().putFloat(KEY_PITCH, p).apply()
 
+    /**
+     * True (default) = the voice picked in the app wins, even when the reading
+     * client (Moon Reader) asks the engine for a different one of our voices.
+     */
+    fun forceVoice(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_FORCE_VOICE, true)
+
+    fun setForceVoice(context: Context, f: Boolean) =
+        prefs(context).edit().putBoolean(KEY_FORCE_VOICE, f).apply()
+
     fun serverUrl(context: Context): String =
         prefs(context).getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
 
@@ -49,4 +62,18 @@ object Settings {
 
     fun setForceServer(context: Context, f: Boolean) =
         prefs(context).edit().putBoolean(KEY_FORCE_SERVER, f).apply()
+
+    /** Last TtsRouter tier name (null = never chosen: server-first default). */
+    fun tier(context: Context): String? =
+        prefs(context).getString(KEY_TIER, null)
+
+    fun setTier(context: Context, t: String) =
+        prefs(context).edit().putString(KEY_TIER, t).apply()
+
+    /** True when the user froze the tier (no automatic switching). */
+    fun tierPinned(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_TIER_PINNED, false)
+
+    fun setTierPinned(context: Context, p: Boolean) =
+        prefs(context).edit().putBoolean(KEY_TIER_PINNED, p).apply()
 }

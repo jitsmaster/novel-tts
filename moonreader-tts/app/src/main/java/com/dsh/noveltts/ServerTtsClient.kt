@@ -23,6 +23,29 @@ object ServerTtsClient {
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    /** Short-timeout client for the recovery ping (must never stall a probe). */
+    private val probeClient = OkHttpClient.Builder()
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .readTimeout(3, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * Cheap reachability ping used by the recovery probe (TtsRouter pings this
+     * every 10 minutes while Edge is the active tier).
+     *
+     * @throws IOException when the server is unreachable or not 2xx
+     */
+    @Throws(IOException::class)
+    fun health(): Boolean {
+        val url: HttpUrl = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegment("health")
+            .build()
+        probeClient.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("health failed: HTTP ${resp.code}")
+            return true
+        }
+    }
+
     /**
      * @return raw audio bytes (mp3 or wav, check the returned media type)
      * @throws IOException on network error or non-2xx
