@@ -131,6 +131,7 @@ class ReaderActivity : AppCompatActivity() {
     private lateinit var titleView: TextView
     private lateinit var chapterView: TextView
     private lateinit var statusView: TextView
+    private lateinit var tierView: TextView
     private lateinit var scrollView: ScrollView
     private lateinit var playBtn: MaterialButton
 
@@ -202,6 +203,15 @@ class ReaderActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             registerReceiver(stateReceiver, filter)
         }
+        val tierFilter = IntentFilter(TtsRouter.ACTION_TIER)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(tierReceiver, tierFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(tierReceiver, tierFilter)
+        }
+        TtsRouter.init(this)
+        refreshTierLine()
         val saved = prefs().getString(KEY_URI, null)
         when {
             testFile != null -> loadTestFile(testFile!!)
@@ -358,6 +368,67 @@ class ReaderActivity : AppCompatActivity() {
         renderChapter()
     }
 
+    // ---- TTS service tier (server / Edge / Google) -------------------------
+
+    private val tierReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            runOnUiThread { refreshTierLine() }
+        }
+    }
+
+    private fun refreshTierLine() {
+        tierView.text = "语音服务：" + TtsRouter.shortLabel() +
+            "（" + (if (TtsRouter.pinned) "已锁定" else if (TtsRouter.manual) "手动" else "自动") +
+            "） · 点击切换"
+    }
+
+    /** Manual tier pick; the automatic rules stay armed afterwards. */
+    private fun showTierDialog() {
+        val tiers = TtsRouter.Tier.values()
+        val labels = tiers.map { (if (it == TtsRouter.home) "✓ " else "   ") + "${it.icon}  ${it.cn}" }
+            .toMutableList()
+        val voiceLabel = "🎙  语音：${Settings.voice(this).removePrefix("zh-CN-").removeSuffix("Neural")}"
+        val lockLabel = if (TtsRouter.pinned) "🔓  解除锁定（恢复自动切换）"
+                        else "🔒  锁定当前服务（不自动切换）"
+        labels.add(voiceLabel)
+        labels.add(lockLabel)
+        android.app.AlertDialog.Builder(this)
+            .setTitle("选择语音服务（当前：" + TtsRouter.home.cn + "）")
+            .setItems(labels.toTypedArray()) { _, which ->
+                when {
+                    which < tiers.size -> TtsRouter.select(this, tiers[which], pin = false)
+                    which == tiers.size -> showVoiceDialog()
+                    else -> if (TtsRouter.pinned) TtsRouter.unpin(this)
+                            else TtsRouter.select(this, TtsRouter.home, pin = true)
+                }
+                refreshTierLine()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /** Voice pick from the reader (same setting as the app's Voice card). */
+    private fun showVoiceDialog() {
+        val voices = TtsEngineService.VOICES
+        val saved = Settings.voice(this)
+        val labels = voices.map { (if (it.name == saved) "✓ " else "   ") +
+            it.name.removePrefix("zh-CN-").removeSuffix("Neural") }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("选择语音（当前：" + saved.removePrefix("zh-CN-").removeSuffix("Neural") + "）")
+            .setItems(labels.toTypedArray()) { _, which ->
+                Settings.setVoice(this, voices[which].name)
+                // The engine reads Settings on every utterance, so the next
+                // sentence already uses the new voice.
+                toast("语音已切换为 " + voices[which].name.removePrefix("zh-CN-").removeSuffix("Neural"))
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun toast(msg: String) {
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+    }
+
     // ---- library (bookshelf) ----------------------------------------------
 
     private fun isBookFile(name: String): Boolean {
@@ -488,8 +559,18 @@ class ReaderActivity : AppCompatActivity() {
             setTextColor(0xFF777777.toInt())
             setPadding(20, 0, 20, 8)
         }
+        // Live "which TTS service is reading right now" line. Tapping it opens
+        // the manual switch, so the user can override the automatic chain at
+        // any moment without leaving the reader.
+        tierView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xFF1565C0.toInt())
+            setPadding(20, 0, 20, 8)
+            setOnClickListener { showTierDialog() }
+        }
         root.addView(titleView)
         root.addView(statusView)
+        root.addView(tierView)
 
         scrollView = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -751,6 +832,7 @@ class ReaderActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        try { unregisterReceiver(tierReceiver) } catch (_: Exception) {}
         try { unregisterReceiver(stateReceiver) } catch (_: Exception) {}
         save()
         super.onDestroy()

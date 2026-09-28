@@ -15,10 +15,11 @@ import java.util.concurrent.atomic.AtomicLong
  * framework hands the engine one utterance at a time and only delivers the
  * next after the previous one fully completed (see TtsEngineService docs).
  *
- * Renders with the same cascade as live playback (cache -> Edge -> server)
- * and the same cache keys (voice|ratePct|pitchHz|text), so pre-rendered
- * sentences are byte-identical cache hits. One job at a time; cancel() stops
- * between sentences (already-fetched sentences stay cached).
+ * Renders through the same TtsRouter tier rules as live playback (server ->
+ * Edge -> Google, see TtsRouter) and the same cache keys
+ * (voice|ratePct|pitchHz|text), so pre-rendered sentences are byte-identical
+ * cache hits. One job at a time; cancel() stops between sentences
+ * (already-fetched sentences stay cached).
  */
 object PreRenderer {
 
@@ -106,24 +107,13 @@ object PreRenderer {
                     if (audio != null) {
                         cached++
                     } else {
-                        // Same cascade as live playback in TtsEngineService.
-                        if (!TtsEngineService.forceServerOnly) {
-                            try {
-                                audio = EdgeTtsClient.synthesize(text, voice, ratePct, pitchHz)
-                            } catch (e: Exception) {
-                                Log.w(TAG, "edge failed (${e.message}); server fallback")
-                            }
-                        }
-                        if (audio == null) {
-                            try {
-                                val (body, _) = ServerTtsClient.synthesize(text, voice, ratePct, pitchHz)
-                                audio = body
-                            } catch (e: Exception) {
-                                failed++
-                                Log.w(TAG, "render failed for segment $i: ${e.message}")
-                            }
-                        }
-                        if (audio != null) {
+                        // Same tier rules as live playback (TtsRouter).
+                        val fetch = TtsRouter.fetch(context, text, voice, ratePct, pitchHz)
+                        if (fetch == null) {
+                            failed++
+                            Log.w(TAG, "render failed for segment $i: every tier failed")
+                        } else {
+                            audio = fetch.bytes
                             cache.put(key, audio)
                             fetched++
                         }

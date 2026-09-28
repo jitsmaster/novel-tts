@@ -27,10 +27,14 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Synthesis cascade per sentence:
  *   1. SQLite sentence cache (instant replay, no network)
- *   2. Edge TTS direct from the phone (free, best quality)
- *   3. DSH server on the Mac (which itself cascades Edge -> Kokoro local)
- * The fallback is fully automatic: if Edge is throttled or broken, the
- * sentence still plays via the local model without any user action.
+ *   2. TtsRouter tiers, in priority order:
+ *        server (Mac)      -> 3 consecutive failures switch to Edge
+ *        Edge (phone)      -> 5 consecutive failures switch to Google TTS
+ *        Google TTS engine -> last resort
+ *      and the failed tier is pinged back online (server every 10 min while
+ *      Edge runs, Edge every 5 min while Google runs).
+ * The fallback is fully automatic: a downed backend never mutes reading, and
+ * the user can also pick a tier by hand in the app / reader UI.
  *
  * Media integration ("like music"):
  *   - A MediaSession makes earphone/headset buttons (play/pause/stop/next)
@@ -46,10 +50,6 @@ class TtsEngineService : TextToSpeechService() {
         private const val SAMPLE_RATE = 24000
         private const val CHUNK = 16 * 1024
         private const val IDLE_TIMEOUT_MS = 3000L
-
-        /** Test hook: skip Edge entirely and go straight to the server tier. */
-        @Volatile
-        var forceServerOnly: Boolean = false
 
         /** The device's native output sample rate (TTS framework plays at this). */
         @Volatile
@@ -88,6 +88,29 @@ class TtsEngineService : TextToSpeechService() {
 
         /** Reader UI state mirror: engine active + speaking. */
         fun isSpeaking(): Boolean = instance?.utteranceActive?.get() ?: false
+    }
+
+    /** The voice the user picked in the app, validated against [VOICES]. */
+    private fun savedVoice(): String {
+        val saved = Settings.voice(this)
+        return if (VOICES.any { it.name == saved }) saved else DEFAULT_VOICE
+    }
+
+    /**
+     * Voice for one utterance.
+     *
+     * The framework client (Moon Reader) normally sends whatever voice it holds
+     * — and it holds OUR default, so a pick made in the app used to be ignored
+     * and every sentence came out as Yunxi. Now:
+     *   - no/unknown voice requested  -> the app's setting
+     *   - Settings.forceVoice (default ON) -> the app's setting wins
+     *   - otherwise the client's own pick (it can only name our three voices)
+     */
+    private fun resolveVoice(requested: String?): String {
+        val saved = savedVoice()
+        if (requested.isNullOrBlank()) return saved
+        if (VOICES.none { it.name == requested }) return saved
+        return if (Settings.forceVoice(this)) saved else requested
     }
 
     private lateinit var cache: SentenceCache
@@ -147,7 +170,16 @@ class TtsEngineService : TextToSpeechService() {
         cache = SentenceCache(this)
         // Apply persisted settings (server URL, debug force-server flag).
         ServerTtsClient.baseUrl = Settings.serverUrl(this)
-        forceServerOnly = Settings.forceServer(this)
+        // Restore the persisted tier (server-first by default) and arm the
+        // recovery pings. The legacy "force server" setting pins the server
+        // tier, i.e. it turns the automatic switching off.
+        TtsRouter.init(this)
+        // Only when no pinned tier was restored: otherwise this legacy flag
+        // would yank a user who locked, say, Google back to a locked server.
+        if (!TtsRouter.pinned && Settings.forceServer(this)) {
+            Log.i(TAG, "force_server setting: pinning the server tier")
+            TtsRouter.select(this, TtsRouter.Tier.SERVER, pin = true)
+        }
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         setupMediaSession()
         // Query the device's native output sample rate; default to 48 kHz.
@@ -332,8 +364,13 @@ class TtsEngineService : TextToSpeechService() {
 
     override fun onGetVoices(): List<Voice> = VOICES
 
+    /**
+     * The voice a client gets when it asks for the default. Returning the
+     * HARDCODED default here is what made the app's voice pick ineffective:
+     * the client then requested Yunxi explicitly for every utterance.
+     */
     override fun onGetDefaultVoiceNameFor(lang: String, country: String, variant: String): String =
-        DEFAULT_VOICE
+        savedVoice()
 
     override fun onIsValidVoiceName(voiceName: String): Int =
         if (VOICES.any { it.name == voiceName }) TextToSpeech.SUCCESS else TextToSpeech.ERROR
@@ -349,7 +386,8 @@ class TtsEngineService : TextToSpeechService() {
             callback.error()
             return
         }
-        val voice = request.voiceName?.takeIf { it.isNotBlank() } ?: DEFAULT_VOICE
+        val requested = request.voiceName
+        val voice = resolveVoice(requested)
         // Modern API: speech rate/pitch are ints where 100 = normal.
         val ratePct = "${request.speechRate - 100}%"
         val pitchHz = "${request.pitch - 100}Hz"
@@ -372,6 +410,9 @@ class TtsEngineService : TextToSpeechService() {
         val tReq = SystemClock.elapsedRealtime()
         val enders = text.count { it == '。' || it == '！' || it == '？' || it == '；' }
         val commas = text.count { it == '，' || it == '、' }
+        if (requested != null && requested != voice) {
+            Log.i(TAG, "voice override: client asked $requested, using $voice")
+        }
         Log.i(TAG, "[perf] req gen=$gen len=${text.length} voice=$voice " +
             "rate=${request.speechRate} pitch=${request.pitch} enders=$enders commas=$commas " +
             "end=${text.lastOrNull()} first=${text.take(14).replace("\n", " ")}")
@@ -434,36 +475,21 @@ class TtsEngineService : TextToSpeechService() {
         var audio: ByteArray? = cache.get(key)
         var source = "cache"
         if (abortIfStale(gen, callback)) return
-        if (audio == null && !forceServerOnly) {
-            // 2) Edge TTS direct
-            try {
-                audio = EdgeTtsClient.synthesize(text, voice, ratePct, pitchHz)
-                source = "edge"
-            } catch (e: Exception) {
-                Log.w(TAG, "Edge failed (${e.message}); trying server")
-            }
-        } else if (audio == null) {
-            Log.w(TAG, "forceServerOnly=true; skipping Edge")
-        }
         if (audio == null) {
-            if (abortIfStale(gen, callback)) return
-            // 3) server fallback (server cascades Edge -> Kokoro locally)
-            try {
-                val (body, _) = ServerTtsClient.synthesize(text, voice, ratePct, pitchHz)
-                audio = body
-                source = "server"
-            } catch (e2: Exception) {
-                Log.e(TAG, "server also failed (${e2.message})")
+            // 2) Live tiers in TtsRouter priority order (server -> Edge ->
+            //    Google). The router counts consecutive failures of the home
+            //    tier and switches backend at 3 (server) / 5 (Edge) failures.
+            val fetch = TtsRouter.fetch(this, text, voice, ratePct, pitchHz)
+            if (fetch == null) {
+                Log.e(TAG, "every TTS tier failed (no audio for this sentence)")
                 try { callback.error() } catch (_: Exception) {}
                 return
             }
+            audio = fetch.bytes
+            source = fetch.tier.label
         }
-        if (audio != null) {
-            cache.put(key, audio)
-        }
-        if (audio != null) {
-            Log.i(TAG, "[perf] fetch gen=$gen source=$source ms=${SystemClock.elapsedRealtime() - tFetch} bytes=${audio.size}")
-        }
+        cache.put(key, audio)
+        Log.i(TAG, "[perf] fetch gen=$gen source=$source ms=${SystemClock.elapsedRealtime() - tFetch} bytes=${audio.size}")
         if (gen != generation.get() || cancelled.get()) {
             // Stop arrived while fetching: return silently. The framework's stop
             // path already notified the client; error() would make clients like

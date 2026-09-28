@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioFocusRequest
@@ -67,14 +69,6 @@ class AudioBookService : Service() {
         const val EXTRA_DUR = "durMs"
         const val EXTRA_REASON = "reason"   // block-start | done | pause | play | seek | stopped | finished | error
         const val EXTRA_MESSAGE = "message" // human-readable detail for reason=error
-
-        /** Server fetch attempts before giving up. The previous version retried
-         * forever, so an unreachable server (phone's Tailscale tunnel down)
-         * meant silent retries with no audio and no error — indistinguishable
-         * from a hung TTS server. */
-        private const val FETCH_ATTEMPTS = 3
-        private const val RETRY_DELAY_MS = 800L
-        private const val RETRY_STEP_MS = 50L
 
         /** Routed by MediaButtonReceiver to whichever player is active. */
         @Volatile
@@ -145,6 +139,24 @@ class AudioBookService : Service() {
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         setupMediaSession()
         createChannel()
+        // Tier state (server / Edge / Google) + recovery pings.
+        TtsRouter.init(this)
+        // Keep the notification's service label honest while reading: the
+        // router can switch tiers on its own (failure threshold or recovery
+        // ping) in the middle of a chapter.
+        val filter = IntentFilter(TtsRouter.ACTION_TIER)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(tierReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(tierReceiver, filter)
+        }
+    }
+
+    private val tierReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            mainHandler.post { updateNotification(lastNotifLine) }
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -204,6 +216,7 @@ class AudioBookService : Service() {
     override fun onDestroy() {
         instance = null
         stopPlayback()
+        try { unregisterReceiver(tierReceiver) } catch (_: Exception) {}
         try { mediaSession?.release() } catch (_: Exception) {}
         mediaSession = null
         super.onDestroy()
@@ -386,17 +399,18 @@ class AudioBookService : Service() {
      * pre-fetch thread passes it so a failure there cannot disturb the block
      * that is playing right now.
      *
-     * Fetching is bounded by [FETCH_ATTEMPTS]. It used to recurse on every
-     * failure with no cap, so an unreachable server (e.g. the phone's Tailscale
-     * tunnel down) meant silent retries forever: no audio, no error, which
-     * looks exactly like a hung TTS server.
+     * The fetch itself goes through [TtsRouter], which owns the tier order
+     * (server -> Edge -> Google), the failure thresholds and the recovery
+     * pings. It returns null only when EVERY tier failed, and that is reported
+     * once instead of looping forever (an uncapped retry used to look exactly
+     * like a hung TTS server: no audio, no error).
      */
     private fun obtainPcm(
         text: String,
         myGen: Long,
         quiet: Boolean = false,
-        attempt: Int = 1,
     ): ByteArray? {
+        if (gen.get() != myGen || stopRequested.get()) return null
         // The SAME voice must be used for the cache key and for synthesis.
         // This used to hash Settings.voice() into the key but synthesize with a
         // hardcoded "zh-CN-YunxiNeural", so picking another voice changed
@@ -404,31 +418,19 @@ class AudioBookService : Service() {
         val voice = Settings.voice(this).takeIf { it.isNotBlank() } ?: "zh-CN-YunxiNeural"
         val key = SentenceCache.key(voice, "+0%", "+0Hz", text)
         var audio = cache().get(key)
-        if (audio == null && !TtsEngineService.forceServerOnly) {
-            try {
-                audio = EdgeTtsClient.synthesize(text, voice, "+0%", "+0Hz")
-            } catch (_: Exception) {}
-        }
         if (audio == null) {
-            try {
-                val (body, _) = ServerTtsClient.synthesize(text, voice, "+0%", "+0Hz")
-                audio = body
-            } catch (e: Exception) {
-                Log.e(TAG, "fetch failed (attempt $attempt/$FETCH_ATTEMPTS): ${e.message}")
-                if (gen.get() != myGen || stopRequested.get()) return null
-                if (attempt >= FETCH_ATTEMPTS) {
-                    reportFetchFailure(e, quiet)
-                    return null
-                }
-                // Interruptible backoff: a stop must not have to wait it out.
-                var waited = 0L
-                while (waited < RETRY_DELAY_MS && gen.get() == myGen && !stopRequested.get()) {
-                    Thread.sleep(RETRY_STEP_MS)
-                    waited += RETRY_STEP_MS
-                }
-                if (gen.get() != myGen || stopRequested.get()) return null
-                return obtainPcm(text, myGen, quiet, attempt + 1)
+            val t0 = SystemClock.elapsedRealtime()
+            val fetch = TtsRouter.fetch(this, text, voice, "+0%", "+0Hz")
+            if (fetch == null) {
+                Log.e(TAG, "every TTS tier failed for this block")
+                reportFetchFailure(quiet)
+                return null
             }
+            audio = fetch.bytes
+            Log.i(TAG, "[fetch] source=${fetch.tier.label} ms=${SystemClock.elapsedRealtime() - t0} " +
+                "bytes=${audio.size} len=${text.length}")
+        } else {
+            Log.i(TAG, "[fetch] source=cache bytes=${audio.size} len=${text.length}")
         }
         cache().put(key, audio)
         val decoded = try {
@@ -447,15 +449,11 @@ class AudioBookService : Service() {
         return toBytes(stereo)
     }
 
-    /** Surface an unrecoverable server failure (notification + reader UI). */
-    private fun reportFetchFailure(e: Exception, quiet: Boolean) {
-        val hint = if (TtsEngineService.forceServerOnly) {
-            "服务器不可达，请检查 Tailscale / 服务器地址"
-        } else {
-            "Edge 与本地服务器均不可用"
-        }
-        Log.e(TAG, "giving up after $FETCH_ATTEMPTS attempts: $hint (${e.message})")
-        if (!quiet) reportFailure("$hint（${e.message ?: "unknown"}）")
+    /** Surface an unrecoverable failure (notification + reader UI). */
+    private fun reportFetchFailure(quiet: Boolean) {
+        val hint = "语音服务全部不可用（${TtsRouter.home.cn} / Edge / Google）"
+        Log.e(TAG, "giving up: $hint")
+        if (!quiet) reportFailure(hint)
     }
 
     private fun reportFailure(message: String) {
@@ -727,7 +725,12 @@ class AudioBookService : Service() {
         }
     }
 
+    /** Last line shown in the notification, so a tier change can refresh it. */
+    @Volatile
+    private var lastNotifLine: String = "小说"
+
     private fun buildNotification(line: String): Notification {
+        lastNotifLine = line
         val pi = PendingIntent.getService(
             this, 2,
             Intent(this, AudioBookService::class.java).setAction(ACTION_PLAY_PAUSE),
@@ -743,7 +746,7 @@ class AudioBookService : Service() {
         } else Notification.Builder(this)
         return builder
             .setContentTitle(bookName)
-            .setContentText(line)
+            .setContentText("$line · ${TtsRouter.shortLabel()}")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_media_pause, "播放/暂停", pi)

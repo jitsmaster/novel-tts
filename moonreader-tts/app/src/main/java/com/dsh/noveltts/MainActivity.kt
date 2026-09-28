@@ -1,6 +1,9 @@
 package com.dsh.noveltts
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Bundle
 import android.provider.Settings as AndroidSettings
 import android.speech.tts.TextToSpeech
@@ -8,12 +11,13 @@ import android.speech.tts.UtteranceProgressListener
 import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.radiobutton.MaterialRadioButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.slider.Slider
@@ -27,9 +31,13 @@ import java.util.concurrent.CountDownLatch
  *
  *  - Engine status card: shows whether this engine is the system default TTS,
  *    with a shortcut to the system TTS settings.
- *  - Voice card: pick one of the bundled voices.
+ *  - Voice card: pick one of the bundled voices (radio group, so the current
+ *    choice is unambiguous) + whether the app's pick overrides the reader's.
  *  - Playback card: rate / pitch sliders.
- *  - Server card: the fallback tier URL + a live connectivity test.
+ *  - Service card: which TTS backend is active right now (server / Edge /
+ *    Google), why, and buttons to pick one by hand — the automatic rules still
+ *    apply from there.
+ *  - Server card: the preferred tier URL + a live connectivity test.
  *  - How to use card: Moon Reader setup steps.
  *  - Diagnostics (collapsed): the raw test harness — reads a bundled novel
  *    excerpt with per-sentence latency, plus the "force server only" switch.
@@ -50,11 +58,28 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logView: TextView
     private lateinit var cacheInfo: TextView
     private lateinit var serverTestResult: TextView
-    private lateinit var voiceToggle: MaterialButtonToggleGroup
+    private lateinit var voiceGroup: RadioGroup
+    private lateinit var forceVoiceSwitch: MaterialSwitch
+    private var refreshingVoice = false
+
+    /** Test hook (adb): makes the client request a voice we did not pick. */
+    private var clientVoiceOverride: String? = null
     private lateinit var rateSlider: Slider
     private lateinit var pitchSlider: Slider
     private lateinit var serverField: TextInputEditText
-    private lateinit var forceServer: MaterialSwitch
+
+    // Service (tier) card state
+    private lateinit var serviceNow: TextView
+    private lateinit var serviceDetail: TextView
+    private lateinit var tierGroup: RadioGroup
+    private lateinit var pinSwitch: MaterialSwitch
+    private lateinit var probeResult: TextView
+    private var refreshingService = false
+    private val tierReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            runOnUiThread { refreshServiceCard() }
+        }
+    }
 
     // Test hooks (adb): auto-start the excerpt and stop after N sentences.
     private var autoplay = false
@@ -85,6 +110,84 @@ class MainActivity : AppCompatActivity() {
         autoplay = intent.getBooleanExtra("autoplay", false)
         val lim = intent.getIntExtra("limit", Int.MAX_VALUE)
         limit = if (lim > 0) lim else Int.MAX_VALUE
+
+        // Deploy hooks (adb), so a freshly installed phone can be pointed at a
+        // TTS server and switched to server-only mode without touching its UI:
+        //   --es server http://host:8321 --ez forceServer true
+        // Written to Settings here, before buildUi() reads them into the
+        // widgets. TtsEngineService reads Settings when the service is created,
+        // so force-stop the app after setting forceServer.
+        intent.getStringExtra("server")?.trim()?.takeIf { it.isNotEmpty() }?.let { url ->
+            Settings.setServerUrl(this, url)
+            ServerTtsClient.baseUrl = url
+            android.util.Log.i("MainActivity", "server URL set from intent: $url")
+        }
+        if (intent.hasExtra("forceServer")) {
+            val forced = intent.getBooleanExtra("forceServer", false)
+            Settings.setForceServer(this, forced)
+            android.util.Log.i("MainActivity", "forceServer set from intent: $forced")
+        }
+
+        // Tier state: restore the persisted choice and arm the recovery pings.
+        TtsRouter.init(this)
+        // Only when no pinned tier was restored (see TtsEngineService).
+        if (!TtsRouter.pinned && Settings.forceServer(this)) {
+            TtsRouter.select(this, TtsRouter.Tier.SERVER, pin = true)
+        }
+
+        // Tier test hooks (adb), mirroring the autoplay/limit hooks below:
+        //   --es tier edge --ez pin true   pick a tier by hand (and lock it)
+        //   --ei probeSeconds 15           shorten the recovery-ping interval
+        //   --ez probeNow true             run one recovery ping right now
+        //   -a com.dsh.noveltts.STATUS     log the router state and exit the hook
+        if (intent.hasExtra("probeSeconds")) {
+            val s = intent.getIntExtra("probeSeconds", 0)
+            TtsRouter.probeIntervalOverrideMs = if (s > 0) s * 1000L else 0L
+            android.util.Log.i("MainActivity", "probe interval override: ${s}s")
+        }
+        TtsRouter.Tier.from(intent.getStringExtra("tier"))?.let { t ->
+            TtsRouter.select(this, t, pin = intent.getBooleanExtra("pin", false))
+            android.util.Log.i("MainActivity", "tier set from intent: ${t.label} pin=${TtsRouter.pinned}")
+        }
+        // Voice test hooks: set the app's voice, pretend the reading client
+        // (Moon Reader) asks for `--es clientVoice <name>`, and/or flip the
+        // "app voice wins" switch.
+        intent.getStringExtra("voice")?.trim()?.takeIf { it.isNotEmpty() }?.let { v ->
+            if (TtsEngineService.VOICES.any { it.name == v }) {
+                Settings.setVoice(this, v)
+                android.util.Log.i("MainActivity", "voice set from intent: $v")
+            }
+        }
+
+        // `--es clientVoice <name>`, and/or flip the "app voice wins" switch.
+        intent.getStringExtra("clientVoice")?.trim()?.takeIf { it.isNotEmpty() }?.let { v ->
+            clientVoiceOverride = v
+            android.util.Log.i("MainActivity", "client voice forced to $v (test hook)")
+        }
+        if (intent.hasExtra("forceVoice")) {
+            val f = intent.getBooleanExtra("forceVoice", true)
+            Settings.setForceVoice(this, f)
+            android.util.Log.i("MainActivity", "forceVoice set from intent: $f")
+        }
+        if (intent.getBooleanExtra("probeNow", false)) {
+            Thread {
+                val res = TtsRouter.probeNow(this)
+                android.util.Log.i("MainActivity", "probe now -> $res")
+            }.start()
+        }
+        if (intent?.action == "com.dsh.noveltts.STATUS") {
+            android.util.Log.i("MainActivity", "=== TIER STATUS ===")
+            for (line in TtsRouter.snapshot().split('\n')) {
+                android.util.Log.i("MainActivity", "TIER| $line")
+            }
+        }
+        val tierFilter = IntentFilter(TtsRouter.ACTION_TIER)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(tierReceiver, tierFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(tierReceiver, tierFilter)
+        }
 
         // Load the bundled novel excerpt (used only by Diagnostics).
         val raw = resources.openRawResource(R.raw.novel_sample).bufferedReader().use { it.readText() }
@@ -142,8 +245,25 @@ class MainActivity : AppCompatActivity() {
     private fun ready() {
         engine.language = Locale.SIMPLIFIED_CHINESE
         runOnUiThread {
+            applyClientVoice()
             updateEngineStatus()
             if (autoplay) startPlayback()
+        }
+    }
+
+    /**
+     * Tells the framework client which voice to request. Without this the client
+     * keeps the default voice it resolved at startup, so changing the voice in
+     * the UI did not change what was spoken (the engine only ever saw Yunxi).
+     */
+    private fun applyClientVoice() {
+        val name = clientVoiceOverride ?: Settings.voice(this)
+        val v = TtsEngineService.VOICES.firstOrNull { it.name == name } ?: return
+        try {
+            val res = engine.setVoice(v)
+            android.util.Log.i("MainActivity", "client voice -> ${v.name} (result=$res)")
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "setVoice failed: ${e.message}")
         }
     }
 
@@ -183,6 +303,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         root.addView(engineStatusCard())
+        root.addView(serviceCard())
         root.addView(readerCard())
         root.addView(voiceCard())
         root.addView(playbackCard())
@@ -244,6 +365,133 @@ class MainActivity : AppCompatActivity() {
         return card("Engine status", col)
     }
 
+    /**
+     * Which TTS service is in use right now, why, and manual switches.
+     *
+     * The automatic chain (TtsRouter) always protects reading: server first,
+     * then Edge after 3 consecutive server failures, then the Google TTS engine
+     * after 5 consecutive Edge failures — and the failed tier is pinged back
+     * online (server every 10 min while Edge runs, Edge every 5 min while
+     * Google runs). A manual pick becomes the new home tier and the same rules
+     * apply from there; "lock" freezes the pick and stops all probing.
+     */
+    private fun serviceCard(): MaterialCardView {
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        serviceNow = TextView(this).apply {
+            textSize = 17f
+            setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+        }
+        col.addView(serviceNow)
+
+        serviceDetail = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xFF666666.toInt())
+            setPadding(0, 6, 0, 12)
+        }
+        col.addView(serviceDetail)
+
+        tierGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            for (t in TtsRouter.Tier.values()) {
+                addView(
+                    MaterialRadioButton(this@MainActivity).apply {
+                        id = View.generateViewId()
+                        text = "${t.icon} ${t.cn}"
+                        textSize = 14f
+                        tag = t
+                        setPadding(0, 10, 0, 10)
+                    }
+                )
+            }
+            setOnCheckedChangeListener { group, checkedId ->
+                if (refreshingService) return@setOnCheckedChangeListener
+                val t = group.findViewById<MaterialRadioButton>(checkedId)?.tag as? TtsRouter.Tier
+                    ?: return@setOnCheckedChangeListener
+                TtsRouter.select(this@MainActivity, t, pin = pinSwitch.isChecked)
+                refreshServiceCard()
+            }
+        }
+        col.addView(tierGroup)
+
+        pinSwitch = MaterialSwitch(this).apply {
+            text = "锁定当前服务（关闭自动切换与恢复探测）"
+            setOnCheckedChangeListener { _, checked ->
+                if (refreshingService) return@setOnCheckedChangeListener
+                if (checked) TtsRouter.select(this@MainActivity, TtsRouter.home, pin = true)
+                else TtsRouter.unpin(this@MainActivity)
+                refreshServiceCard()
+            }
+        }
+        col.addView(pinSwitch)
+
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val probeBtn = MaterialButton(this).apply {
+            text = "立即探测"
+            textSize = 13f
+            isAllCaps = false
+        }
+        probeBtn.setOnClickListener {
+            probeResult.text = "探测中…"
+            Thread {
+                val r = TtsRouter.probeNow(this@MainActivity)
+                runOnUiThread {
+                    probeResult.text = r
+                    refreshServiceCard()
+                }
+            }.start()
+        }
+        probeResult = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(16, 0, 0, 0)
+        }
+        row.addView(probeBtn)
+        row.addView(
+            probeResult,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        col.addView(row)
+
+        col.addView(
+            TextView(this).apply {
+                text = "自动规则：服务器优先 → 连续失败 3 次转 Edge → Edge 连续失败 5 次转 Google。\n" +
+                    "恢复探测：在 Edge 时每 10 分钟探测服务器；在 Google 时每 5 分钟探测 Edge，恢复即切回。\n" +
+                    "手动选择后同样适用这些规则；锁定时不自动切换。\n" +
+                    "兜底引擎：" + GoogleTtsClient.describe(this@MainActivity)
+                textSize = 11f
+                setTextColor(0xFF888888.toInt())
+                setPadding(0, 10, 0, 0)
+            }
+        )
+
+        refreshServiceCard()
+        return card("语音服务（当前 / 手动切换）", col)
+    }
+
+    /** Repaints the service card from the live TtsRouter state. */
+    private fun refreshServiceCard() {
+        refreshingService = true
+        try {
+            val lines = TtsRouter.snapshot().split("\n")
+            serviceNow.text = lines.firstOrNull() ?: ""
+            serviceDetail.text = lines.drop(1).joinToString("\n")
+            for (i in 0 until tierGroup.childCount) {
+                val b = tierGroup.getChildAt(i) as? MaterialRadioButton ?: continue
+                val t = b.tag as? TtsRouter.Tier ?: continue
+                // A tier with no engine on this device (no Google TTS / Pico)
+                // must not look selectable.
+                b.isEnabled = TtsRouter.available(this, t)
+                if (t == TtsRouter.home) {
+                    tierGroup.check(b.id)
+                }
+            }
+            pinSwitch.isChecked = TtsRouter.pinned
+        } finally {
+            refreshingService = false
+        }
+    }
+
     /** Standalone audiobook reader (no Moon Reader / no TTS framework). */
     private fun readerCard(): MaterialCardView {
         val btn = MaterialButton(this).apply {
@@ -266,34 +514,82 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun voiceCard(): MaterialCardView {
-        voiceToggle = MaterialButtonToggleGroup(this).apply {
-            isSingleSelection = true
-            val saved = Settings.voice(this@MainActivity)
-            var savedBtn: MaterialButton? = null
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // A RadioGroup, not a button toggle group: the current voice must be
+        // obvious at a glance and exactly one is always checked.
+        voiceGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
             for (v in TtsEngineService.VOICES) {
-                val b = MaterialButton(this@MainActivity).apply {
-                    id = View.generateViewId()
-                    text = v.name.removePrefix("zh-CN-").removeSuffix("Neural")
-                    tag = v.name
-                }
-                if (v.name == saved) savedBtn = b
-                addView(b)
+                addView(
+                    MaterialRadioButton(this@MainActivity).apply {
+                        id = View.generateViewId()
+                        text = voiceLabel(v.name)
+                        textSize = 14f
+                        tag = v.name
+                        setPadding(0, 10, 0, 10)
+                    }
+                )
             }
-            addOnButtonCheckedListener { _, checkedId, isChecked ->
-                if (isChecked) {
-                    val b = findViewById<MaterialButton>(checkedId)
-                    Settings.setVoice(this@MainActivity, b.tag as String)
-                }
+            setOnCheckedChangeListener { group, checkedId ->
+                if (refreshingVoice) return@setOnCheckedChangeListener
+                val name = group.findViewById<MaterialRadioButton>(checkedId)?.tag as? String
+                    ?: return@setOnCheckedChangeListener
+                Settings.setVoice(this@MainActivity, name)
+                applyClientVoice()
+                appendLog("=== voice -> $name")
             }
-            // The toggle GROUP owns its children's checked state, so the
-            // selection has to be applied here - after the buttons are attached.
-            // Setting isChecked on each button before addView() was silently
-            // dropped, which is why the saved voice never showed as selected
-            // (while Settings kept holding it, so audio used the old pick).
-            // Fall back to the first voice so exactly one is always visible.
-            (savedBtn ?: voiceToggle.getChildAt(0) as? MaterialButton)?.let { check(it.id) }
         }
-        return card("Voice", voiceToggle)
+        col.addView(voiceGroup)
+
+        forceVoiceSwitch = MaterialSwitch(this@MainActivity).apply {
+            text = "以此处选择的语音为准（覆盖阅读器内部选择）"
+            textSize = 13f
+            isChecked = Settings.forceVoice(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Settings.setForceVoice(this@MainActivity, checked)
+                applyClientVoice()
+            }
+        }
+        col.addView(forceVoiceSwitch)
+
+        col.addView(
+            TextView(this).apply {
+                text = "语音由朗读引擎按这里的设置合成。关闭上面的开关时，如果阅读器自己指定了" +
+                    "另一个语音（同为 Yunxi / Yunjian / Xiaobei），则跟随阅读器。"
+                textSize = 11f
+                setTextColor(0xFF888888.toInt())
+                setPadding(0, 6, 0, 0)
+            }
+        )
+
+        selectSavedVoice()
+        return card("Voice（语音）", col)
+    }
+
+    private fun voiceLabel(name: String): String = when (name) {
+        "zh-CN-YunxiNeural" -> "Yunxi（年轻男声 · 默认）"
+        "zh-CN-YunjianNeural" -> "Yunjian（沉稳男声）"
+        "zh-CN-XiaobeiNeural" -> "Xiaobei（成熟女声）"
+        else -> name.removePrefix("zh-CN-").removeSuffix("Neural")
+    }
+
+    /** Checks the persisted voice; always leaves exactly one radio selected. */
+    private fun selectSavedVoice() {
+        refreshingVoice = true
+        try {
+            val saved = Settings.voice(this)
+            for (i in 0 until voiceGroup.childCount) {
+                val b = voiceGroup.getChildAt(i) as? MaterialRadioButton ?: continue
+                if (b.tag == saved) {
+                    voiceGroup.check(b.id)
+                    return
+                }
+            }
+            (voiceGroup.getChildAt(0) as? MaterialRadioButton)?.let { voiceGroup.check(it.id) }
+        } finally {
+            refreshingVoice = false
+        }
     }
 
     private fun playbackCard(): MaterialCardView {
@@ -337,7 +633,7 @@ class MainActivity : AppCompatActivity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         val input = TextInputLayout(this).apply {
-            hint = "Server URL (fallback tier)"
+            hint = "Server URL (首选服务)"
             boxBackgroundMode = com.google.android.material.textfield.TextInputLayout.BOX_BACKGROUND_OUTLINE
         }
         serverField = TextInputEditText(this).apply {
@@ -364,8 +660,8 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(
             TextView(this).apply {
-                text = "Used only when Edge TTS fails (throttled/offline). " +
-                    "Defaults to your Mac mini over Tailscale."
+                text = "首选服务。不可达时自动回退到 Edge（3 次失败）→ Google TTS（5 次失败），" +
+                    "并在后台探测恢复。默认是你的 Mac mini（Tailscale）。"
                 textSize = 12f
                 setTextColor(0xFF888888.toInt())
             }
@@ -501,15 +797,14 @@ class MainActivity : AppCompatActivity() {
     private fun diagnosticsCard(): MaterialCardView {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        forceServer = MaterialSwitch(this).apply {
-            text = "Force server-only (skip Edge)"
-            isChecked = Settings.forceServer(this@MainActivity)
-            setOnCheckedChangeListener { _, checked ->
-                Settings.setForceServer(this@MainActivity, checked)
-                TtsEngineService.forceServerOnly = checked
+        col.addView(
+            TextView(this).apply {
+                text = "服务层级（服务器 / Edge / Google）在顶部的“语音服务”卡片中切换。"
+                textSize = 12f
+                setTextColor(0xFF888888.toInt())
+                setPadding(0, 0, 0, 10)
             }
-        }
-        col.addView(forceServer)
+        )
 
         // TTS sentence cache: live size + manual clear (auto-trims above the
         // budget in SentenceCache, but a manual clear is handy after a big read).
@@ -628,6 +923,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        try {
+            unregisterReceiver(tierReceiver)
+        } catch (e: Exception) {}
         try {
             engine.stop()
             engine.shutdown()
