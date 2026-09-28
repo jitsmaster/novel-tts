@@ -10,7 +10,8 @@ Moon Reader (or the built-in reader)
         ├─ 0. SQLite sentence cache        (instant replay, no network)
         └─ TtsRouter tiers, in priority order:
              1. DSH TTS server on the Mac (http://100.85.43.11:8321)   ← preferred
-                  └─ the server itself cascades: Edge TTS → Kokoro-82M (local, offline)
+                  └─ speaks its own LOCAL Kokoro models (108 Mandarin voices,
+                     no internet); Edge TTS only for a voice picked as such
              2. Edge TTS, direct from the phone (wss://speech.platform.bing.com)
              3. Google TTS on the device (com.google.android.tts)      ← last resort
 ```
@@ -60,13 +61,26 @@ pre-render and the standalone reader alike):
     exits and launchd retries. The server therefore comes up automatically once
     the drive is available — no manual reload needed. Wrapper log:
     `/tmp/com.dsh.noveltts.wrapper.log`.
-- Endpoints: `GET /tts?text=…&voice=…&rate=…&pitch=…` → audio/mpeg (Edge) or audio/wav (Kokoro)
-  `GET /health`, `GET /voices`
+- Endpoints: `GET /tts?text=…&voice=…&rate=…&pitch=…&engine=auto|kokoro|edge`
+  → audio/wav (local Kokoro) or audio/mpeg (Edge); `GET /health`, `GET /voices`
+- **Voices — which engine speaks follows the voice NAME:**
+  `zm_yunxi`, `zf_xiaobei`, `zf_001`, `zm_010` … are local Kokoro speakers (the
+  default), `zh-CN-YunxiNeural` … are Edge voices and are used only when one of
+  those is asked for. `engine=` overrides it per request, and an unknown name is
+  a 400 instead of being silently replaced by a different voice.
 - `rate`/`pitch` follow Edge's syntax and must be **signed** (`+0%`, `-15%`, `+0Hz`).
   edge-tts rejects a bare `0Hz`, and the tier then silently falls back to Kokoro;
   the server normalises a missing sign, and the app writes signed values
   (`EdgeTtsClient.signedPct` / `signedHz`).
 - Per-sentence disk cache in `tts-server/cache/`
+- **108 Mandarin voices, all local**: 8 from `hexgrad/Kokoro-82M` plus the 100
+  speakers of `hexgrad/Kokoro-82M-v1.1-zh`. The daemon runs with
+  `HF_HUB_OFFLINE=1`, so a voice pack that is not already cached cannot be
+  fetched at runtime (that is why a voice used to speak as a same-gender stand-in,
+  and why an unknown name spoke Yunxi). To (re)download them:
+  `cd tts-server && .venv-local/bin/python fetch_voices.py` (`--list` reports only).
+  The 800 MB of checkpoints stay in the HuggingFace cache; only the ~500 KB voice
+  packs belong to this step.
 - Kokoro benchmark on this M4 (post-warmup): RTF 0.11–0.13 ≈ 9× realtime; a 5 s
   sentence renders in ~0.6 s. First sentence ~1.7–2.6 s (warmup, pre-warmed at boot).
 
@@ -106,7 +120,10 @@ pre-render and the standalone reader alike):
   utterance strings byte-for-byte (same source text incl. leading indents).
   Moon Reader chunks one 。！？-terminated sentence per utterance.
 - MainActivity — settings + diagnostics: bundled 三國志演義 excerpt (3088
-  sentences), per-sentence latency, rate/pitch sliders, a voice radio group,
+  sentences), per-sentence latency, rate/pitch sliders, a voice radio group
+  (all 108 local Kokoro speakers + the 8 Edge ones; the 100 v1.1-zh speakers sit
+  in their own collapsible section, and the voice actually in use is shown above
+  the list),
   sentence-cache size/clear, Pre-render card, editable server URL, and the
   **语音服务 card**: the tier in use right now, why it switched, the failure
   counter, the next ping, a service radio group (服务器 / Edge / Google, one
