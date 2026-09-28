@@ -62,6 +62,10 @@ pre-render and the standalone reader alike):
     `/tmp/com.dsh.noveltts.wrapper.log`.
 - Endpoints: `GET /tts?text=…&voice=…&rate=…&pitch=…` → audio/mpeg (Edge) or audio/wav (Kokoro)
   `GET /health`, `GET /voices`
+- `rate`/`pitch` follow Edge's syntax and must be **signed** (`+0%`, `-15%`, `+0Hz`).
+  edge-tts rejects a bare `0Hz`, and the tier then silently falls back to Kokoro;
+  the server normalises a missing sign, and the app writes signed values
+  (`EdgeTtsClient.signedPct` / `signedHz`).
 - Per-sentence disk cache in `tts-server/cache/`
 - Kokoro benchmark on this M4 (post-warmup): RTF 0.11–0.13 ≈ 9× realtime; a 5 s
   sentence renders in ~0.6 s. First sentence ~1.7–2.6 s (warmup, pre-warmed at boot).
@@ -102,11 +106,13 @@ pre-render and the standalone reader alike):
   utterance strings byte-for-byte (same source text incl. leading indents).
   Moon Reader chunks one 。！？-terminated sentence per utterance.
 - MainActivity — settings + diagnostics: bundled 三國志演義 excerpt (3088
-  sentences), per-sentence latency, rate/pitch sliders, voice spinner,
+  sentences), per-sentence latency, rate/pitch sliders, a voice radio group,
   sentence-cache size/clear, Pre-render card, editable server URL, and the
   **语音服务 card**: the tier in use right now, why it switched, the failure
-  counter, the next ping, manual tier buttons (服务器 / Edge / Google), a lock
-  switch and an "立即探测" button. Test hooks via intent extras:
+  counter, the next ping, a service radio group (服务器 / Edge / Google, one
+  always checked, the current tier marked), a lock switch and an "立即探测"
+  button. Both radio groups re-read the saved choices on resume, so they cannot
+  show a stale selection after a change made in the reader. Test hooks via intent extras:
   `--ez autoplay true --ei limit N` (play first N sample sentences),
   `-a com.dsh.noveltts.CLEAR_CACHE`, `-a com.dsh.noveltts.STATUS` (dump the tier
   state to logcat as `TIER|`), `--es tier <server|edge|google> --ez pin <bool>`,
