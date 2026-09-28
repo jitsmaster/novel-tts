@@ -416,21 +416,20 @@ class ReaderActivity : AppCompatActivity() {
      * for its own voice and the switch looks like it does nothing.
      */
     private fun showVoiceDialog() {
-        val voices = TtsEngineService.VOICES
+        val entries = Voices.all
         val saved = Settings.voice(this)
-        val short = { name: String -> name.removePrefix("zh-CN-").removeSuffix("Neural") }
-        val labels = voices.map {
-            short(it.name) + (if (it.name == saved) "（当前）" else "")
+        val labels = entries.map { e ->
+            e.label + if (e.name == saved) "（当前）" else ""
         }.toTypedArray()
-        val current = voices.indexOfFirst { it.name == saved }
+        val current = entries.indexOfFirst { it.name == saved }
         android.app.AlertDialog.Builder(this)
-            .setTitle("选择语音（当前：" + short(saved) + "）")
+            .setTitle("选择语音（当前：" + Voices.label(saved) + "）")
             .setSingleChoiceItems(labels, current) { dialog, which ->
-                Settings.setVoice(this, voices[which].name)
+                Settings.setVoice(this, entries[which].name)
                 Settings.setForceVoice(this, true)
                 // The engine reads Settings on every utterance, so the next
                 // sentence already uses the new voice.
-                toast("语音已切换为 " + short(voices[which].name))
+                toast("语音已切换为 " + entries[which].label)
                 dialog.dismiss()
             }
             .setNegativeButton("取消", null)

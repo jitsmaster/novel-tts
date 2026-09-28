@@ -46,7 +46,8 @@ class TtsEngineService : TextToSpeechService() {
 
     companion object {
         private const val TAG = "NovelTtsEngine"
-        private const val DEFAULT_VOICE = "zh-CN-YunxiNeural"
+        /** Local Kokoro speaker by default; Edge only when picked on purpose. */
+        private const val DEFAULT_VOICE = Voices.DEFAULT
         private const val SAMPLE_RATE = 24000
         private const val CHUNK = 16 * 1024
         private const val IDLE_TIMEOUT_MS = 3000L
@@ -55,20 +56,11 @@ class TtsEngineService : TextToSpeechService() {
         @Volatile
         var nativeOutputRate: Int = 48000
 
-        val VOICES = listOf(
-            Voice(
-                "zh-CN-YunxiNeural", Locale.SIMPLIFIED_CHINESE,
-                Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL, false, emptySet()
-            ),
-            Voice(
-                "zh-CN-YunjianNeural", Locale.SIMPLIFIED_CHINESE,
-                Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL, false, emptySet()
-            ),
-            Voice(
-                "zh-CN-XiaobeiNeural", Locale.SIMPLIFIED_CHINESE,
-                Voice.QUALITY_HIGH, Voice.LATENCY_NORMAL, false, emptySet()
-            ),
-        )
+        /**
+         * Every voice the app offers: the server's 108 local Kokoro Mandarin
+         * speakers plus Edge's eight online ones (see [Voices]).
+         */
+        val VOICES: List<Voice> = Voices.frameworkVoices()
 
         /** Set by the service on create; used by MediaButtonReceiver to dispatch keys. */
         @Volatile
@@ -92,6 +84,7 @@ class TtsEngineService : TextToSpeechService() {
 
     /** The voice the user picked in the app, validated against [VOICES]. */
     private fun savedVoice(): String {
+        Settings.migrateVoiceToLocal(this)
         val saved = Settings.voice(this)
         return if (VOICES.any { it.name == saved }) saved else DEFAULT_VOICE
     }

@@ -60,6 +60,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var serverTestResult: TextView
     private lateinit var voiceGroup: RadioGroup
     private lateinit var forceVoiceSwitch: MaterialSwitch
+    private lateinit var voiceNow: TextView
+    private var v11Toggle: MaterialButton? = null
+    private val v11Buttons = mutableListOf<MaterialRadioButton>()
+    private var v11Shown = false
     private var refreshingVoice = false
 
     /** Test hook (adb): makes the client request a voice we did not pick. */
@@ -92,6 +96,11 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
+
+        // A voice saved by an older build was one of the Edge names (they were
+        // the only ones offered). Move it to the local speaker with the same
+        // persona once, before anything reads it (see Settings).
+        Settings.migrateVoiceToLocal(this)
 
         // TTS engines must answer CHECK_TTS_DATA so the system lists them as
         // available. Return our voices as the "available" set.
@@ -536,20 +545,40 @@ class MainActivity : AppCompatActivity() {
     private fun voiceCard(): MaterialCardView {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // A RadioGroup, not a button toggle group: the current voice must be
-        // obvious at a glance and exactly one is always checked.
+        voiceNow = TextView(this).apply {
+            textSize = 16f
+            setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            setPadding(0, 0, 0, 12)
+        }
+        col.addView(voiceNow)
+
+        // ONE RadioGroup holds every voice, so exactly one button is checked at
+        // all times and the checked one is what gets spoken. The 100 extra
+        // v1.1-zh speakers start hidden - a 116-row list would bury the rest of
+        // the screen - and the button inside the list reveals them.
         voiceGroup = RadioGroup(this).apply {
             orientation = RadioGroup.VERTICAL
-            for (v in TtsEngineService.VOICES) {
-                addView(
-                    MaterialRadioButton(this@MainActivity).apply {
-                        id = View.generateViewId()
-                        text = voiceLabel(v.name)
-                        textSize = 14f
-                        tag = v.name
-                        setPadding(0, 10, 0, 10)
-                    }
-                )
+            var currentGroup: String? = null
+            for (e in Voices.all) {
+                if (e.group != currentGroup) {
+                    currentGroup = e.group
+                    val n = Voices.all.count { it.group == e.group }
+                    addView(sectionLabel("${e.group}（$n）"))
+                    // The expander sits directly above the block it opens.
+                    if (e.group == Voices.GROUP_KOKORO_V11) addView(v11ToggleButton())
+                }
+                val b = MaterialRadioButton(this@MainActivity).apply {
+                    id = View.generateViewId()
+                    text = e.label
+                    textSize = 14f
+                    tag = e.name
+                    setPadding(0, 8, 0, 8)
+                }
+                if (e.group == Voices.GROUP_KOKORO_V11) {
+                    b.visibility = View.GONE
+                    v11Buttons.add(b)
+                }
+                addView(b)
             }
             setOnCheckedChangeListener { group, checkedId ->
                 if (refreshingVoice) return@setOnCheckedChangeListener
@@ -566,6 +595,7 @@ class MainActivity : AppCompatActivity() {
                     appendLog("=== voice override switched ON (a voice was picked)")
                 }
                 applyClientVoice()
+                refreshVoiceLabels()
                 appendLog("=== voice -> $name")
             }
         }
@@ -584,8 +614,9 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(
             TextView(this).apply {
-                text = "语音由朗读引擎按这里的设置合成。关闭上面的开关时，如果阅读器自己指定了" +
-                    "另一个语音（同为 Yunxi / Yunjian / Xiaobei），则跟随阅读器。"
+                text = "本地 Kokoro 语音由 TTS 服务器用本机模型朗读（不需要网络，" +
+                    "也是默认的朗读方式）；只有名字带 “Edge” 的语音才走微软 Edge " +
+                    "在线朗读。打开下面的开关时，此处选择的语音会覆盖阅读器自己的选择。"
                 textSize = 11f
                 setTextColor(0xFF888888.toInt())
                 setPadding(0, 6, 0, 0)
@@ -596,11 +627,41 @@ class MainActivity : AppCompatActivity() {
         return card("Voice（语音）", col)
     }
 
-    private fun voiceLabel(name: String): String = when (name) {
-        "zh-CN-YunxiNeural" -> "Yunxi（年轻男声 · 默认）"
-        "zh-CN-YunjianNeural" -> "Yunjian（沉稳男声）"
-        "zh-CN-XiaobeiNeural" -> "Xiaobei（成熟女声）"
-        else -> name.removePrefix("zh-CN-").removeSuffix("Neural")
+    /** A non-radio header row inside the voice RadioGroup. */
+    private fun sectionLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 13f
+        setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+        setTextColor(0xFF555555.toInt())
+        setPadding(0, 14, 0, 4)
+    }
+
+    /** Shows/hides the 100 Kokoro-82M-v1.1-zh speakers. */
+    private fun v11ToggleButton(): MaterialButton = MaterialButton(this).apply {
+        textSize = 13f
+        isAllCaps = false
+        v11Toggle = this
+        setOnClickListener {
+            v11Shown = !v11Shown
+            for (b in v11Buttons) b.visibility = if (v11Shown) View.VISIBLE else View.GONE
+            v11Toggle?.text = if (v11Shown) "收起 v1.1 语音"
+                                  else "展开 v1.1 语音（100 个）"
+            // Keep the picked voice reachable: if it lives in the hidden block,
+            // open the block so its radio is visible.
+            if (Settings.voice(this@MainActivity) in v11Buttons.map { it.tag }) {
+                if (v11Shown) appendLog("=== v1.1 voice list expanded")
+            }
+            refreshVoiceLabels()
+        }
+        text = if (v11Shown) "收起 v1.1 语音" else "展开 v1.1 语音（100 个）"
+    }
+
+    /** "当前语音：…" line: voice, and which engine will speak it. */
+    private fun refreshVoiceLabels() {
+        val name = Settings.voice(this)
+        val e = Voices.entry(name)
+        voiceNow.text = "当前语音：" + (e?.label ?: name) +
+            if (e == null) "" else if (e.local) "　（本机模型，无需网络）" else "　（Edge 在线）"
     }
 
     /** Checks the persisted voice; always leaves exactly one radio selected. */
@@ -608,18 +669,28 @@ class MainActivity : AppCompatActivity() {
         refreshingVoice = true
         try {
             val saved = Settings.voice(this)
+            var found: MaterialRadioButton? = null
             for (i in 0 until voiceGroup.childCount) {
                 val b = voiceGroup.getChildAt(i) as? MaterialRadioButton ?: continue
-                if (b.tag == saved) {
-                    voiceGroup.check(b.id)
-                    return
-                }
+                if (b.tag == saved) found = b
             }
-            (voiceGroup.getChildAt(0) as? MaterialRadioButton)?.let { voiceGroup.check(it.id) }
+            val target = found ?: (voiceGroup.getChildAt(0) as? MaterialRadioButton)
+            if (target != null) {
+                // A voice from the collapsed block has to be shown, or the
+                // "selection" would be invisible.
+                if (target in v11Buttons && !v11Shown) {
+                    v11Shown = true
+                    for (b in v11Buttons) b.visibility = View.VISIBLE
+                    v11Toggle?.text = "收起 v1.1 语音"
+                }
+                voiceGroup.check(target.id)
+            }
         } finally {
             refreshingVoice = false
         }
+        refreshVoiceLabels()
     }
+
 
     private fun playbackCard(): MaterialCardView {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
