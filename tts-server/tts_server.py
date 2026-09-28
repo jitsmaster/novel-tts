@@ -189,6 +189,20 @@ def edge_synthesize(text: str, voice: str, rate: str, pitch: str) -> bytes:
 
 # ---- Cache ------------------------------------------------------------------
 
+def _signed(value: str, unit: str) -> str:
+    """Edge wants an explicit sign AND unit: "0Hz" -> "+0Hz", "-15%" -> "-15%".
+
+    A bare value without the sign (or the unit) would make edge-tts reject the
+    request, which silently degraded every such sentence to the Kokoro fallback.
+    """
+    v = (value or "").strip()
+    if v and v[0] not in "+-":
+        v = "+" + v
+    if not v.endswith(unit):
+        v = (v or "+0") + unit
+    return v
+
+
 def _cache_key(text: str, voice: str, rate: str, pitch: str) -> str:
     h = hashlib.sha256(f"{voice}|{rate}|{pitch}|{text}".encode("utf-8")).hexdigest()
     return h
@@ -258,6 +272,13 @@ async def tts(
         # Allow any zh-CN Edge voice even if not pre-mapped; Kokoro fallback
         # then uses the closest mapped voice or default.
         pass
+
+    # Edge rate/pitch must be SIGNED. A client that sends a bare "0%" / "0Hz"
+    # (the Android engine did, until EdgeTtsClient.signedPct) makes edge-tts
+    # raise "Invalid pitch '0Hz'" and EVERY such sentence silently landed on the
+    # Kokoro fallback. Be tolerant here instead of degrading the tier.
+    rate = _signed(rate, "%")
+    pitch = _signed(pitch, "Hz")
 
     key = _cache_key(text, voice, rate, pitch)
 

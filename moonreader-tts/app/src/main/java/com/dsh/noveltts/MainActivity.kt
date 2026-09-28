@@ -785,16 +785,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPreRenderUnits(units: List<String>) {
         val voice = Settings.voice(this)
-        val ratePct = rateSlider.value.let { r ->
-            // Mirror the TextToSpeech client + TtsEngineService exactly:
-            // client sends round(rate*100); engine keys with (int - 100).
-            val pct = Math.round(r * 100f) - 100
-            if (pct > 0) "+$pct%" else "$pct%"
-        }
-        val pitchHz = pitchSlider.value.let { p ->
-            val hz = Math.round(p * 100f) - 100
-            if (hz > 0) "+${hz}Hz" else "${hz}Hz"
-        }
+        // Mirror the TextToSpeech client + TtsEngineService exactly: the client
+        // sends round(rate*100), the engine keys with (int - 100). The value
+        // must be signed, including the neutral "+0%"/"+0Hz"
+        // (see EdgeTtsClient.signedPct).
+        val ratePct = EdgeTtsClient.signedPct(Math.round(rateSlider.value * 100f) - 100)
+        val pitchHz = EdgeTtsClient.signedHz(Math.round(pitchSlider.value * 100f) - 100)
         val nTotal = units.size
         preStatus.text = "Pre-rendering $nTotal sentences (voice=$voice $ratePct $pitchHz)…"
         appendLog("=== Pre-render start: $nTotal sentences, voice=$voice rate=$ratePct pitch=$pitchHz")

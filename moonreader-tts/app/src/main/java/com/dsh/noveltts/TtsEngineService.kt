@@ -389,8 +389,9 @@ class TtsEngineService : TextToSpeechService() {
         val requested = request.voiceName
         val voice = resolveVoice(requested)
         // Modern API: speech rate/pitch are ints where 100 = normal.
-        val ratePct = "${request.speechRate - 100}%"
-        val pitchHz = "${request.pitch - 100}Hz"
+        // Signed: Edge rejects a bare "0%" / "0Hz" (see EdgeTtsClient.signedPct).
+        val ratePct = EdgeTtsClient.signedPct(request.speechRate - 100)
+        val pitchHz = EdgeTtsClient.signedHz(request.pitch - 100)
 
         // Only a FRESH stream (the engine was idle) means the user started
         // reading and wants audio now: clear any stale pause-hold. A

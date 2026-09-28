@@ -75,6 +75,16 @@ object EdgeTtsClient {
     private fun xmlEscape(text: String): String =
         text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    /**
+     * Edge rate/pitch parameters are SIGNED: "0%" / "0Hz" are invalid and the
+     * request fails ("Invalid pitch '0Hz'" on the server's edge-tts, and the
+     * server then silently drops to its Kokoro fallback for every sentence the
+     * user reads at a neutral pitch). Neutral must be written "+0%"/"+0Hz".
+     */
+    fun signedPct(pct: Int): String = (if (pct >= 0) "+" else "") + pct + "%"
+
+    fun signedHz(hz: Int): String = (if (hz >= 0) "+" else "") + hz + "Hz"
+
     private fun mkssml(text: String, voice: String, ratePct: String, pitchHz: String): String =
         "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>" +
             "<voice name='$voice'>" +
