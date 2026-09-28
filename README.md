@@ -24,11 +24,14 @@ pre-render and the standalone reader alike):
   the current tier.
 - A single request never goes silent: it walks down the remaining tiers, so the
   sentence still plays while the current tier's failure counter accumulates.
-  A LOCAL voice (the default) has no Edge speaker, so the Edge tier uses the Edge
-  voice with the same persona — `zm_yunjian` is read by `zh-CN-YunjianNeural` —
-  and logs `Edge stands in for local voice …`. The 100 v1.1-zh voices have no
-  Edge mirror and continue to the Google tier; the Edge recovery ping makes the
-  same substitution, or it could never succeed with a local voice selected.
+  A LOCAL voice (the default) has no Edge speaker, so the Edge tier substitutes
+  and logs `Edge stands in for local voice …`: the eight v1.0 speakers use the
+  Edge voice with the SAME persona (`zm_yunjian` → `zh-CN-YunjianNeural`), and
+  the 100 v1.1-zh speakers — which Edge never recorded — use a fixed voice per
+  gender (`zf_*` → `zh-CN-XiaoniNeural`, `zm_*` → `zh-CN-YunjianNeural`).
+  Google is reached only when Edge fails as well, and the Edge recovery ping
+  makes the same substitution, or it could never succeed while a local voice
+  was selected.
 - **Recovery pings**: while Edge is in use the server is pinged every 10 minutes;
   while Google is in use Edge is pinged every 5 minutes. A successful ping switches
   back up (Google → Edge, then Edge → server), so the chain walks all the way back
