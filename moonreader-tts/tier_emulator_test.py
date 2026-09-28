@@ -370,6 +370,38 @@ check("V5 the LOCAL Xiaobei radio is checked (not the Edge one)", local_sel,
 check("V5b the picker offers the full catalogue (Kokoro v1.0 / v1.1-zh / Edge)",
       not missing, "all three sections found" if not missing else "missing: %s" % missing)
 
+# ------------------------ V6: offline server -> Edge voice of the same persona
+# A local voice has no Edge speaker, so without a stand-in the sentence would
+# fall through to the phone's Google engine. v1.1-zh voices get a fixed voice
+# per gender (zf_* -> Xiaoni, zm_* -> Yunjian).
+stop()
+time.sleep(1)
+config_only(server=DEAD, tier="server", pin=False, clear=True)
+clear_log()
+start(MAIN, "--es", "voice", "zf_001", "--ez", "forceVoice", "true",
+      "--es", "tier", "server", "--ez", "pin", "false",
+      "--ez", "autoplay", "true", "--ei", "limit", "2")
+time.sleep(30)
+v6 = logs("NovelTtsEngine", "NovelTtsRouter")
+check("V6 server offline: a v1.1-zh voice falls back to a gender-matched Edge voice",
+      "Edge stands in for local voice zf_001 -> zh-CN-XiaoniNeural" in v6
+      and "source=edge" in v6 and "source=google" not in v6,
+      [l.split("NovelTtsEngine: ")[-1][:70] for l in v6.splitlines()
+       if "stands in" in l or "fetch gen" in l][:2])
+stop()
+time.sleep(1)
+config_only(server=DEAD, tier="server", pin=False, clear=True)
+clear_log()
+start(MAIN, "--es", "voice", "zm_010", "--ez", "forceVoice", "true",
+      "--es", "tier", "server", "--ez", "pin", "false",
+      "--ez", "autoplay", "true", "--ei", "limit", "1")
+time.sleep(25)
+v6b = logs("NovelTtsEngine", "NovelTtsRouter")
+check("V6b a local male voice falls back to Yunjian when the server is offline",
+      "Edge stands in for local voice zm_010 -> zh-CN-YunjianNeural" in v6b
+      and "source=edge" in v6b,
+      [l.split("NovelTtsEngine: ")[-1][:70] for l in v6b.splitlines() if "stands in" in l][:1])
+
 # cleanup / restore the app to its normal state on this emulator
 config_only(server=PHONE_DEFAULT, tier="server", pin=False)
 shell("am start -n %s --es voice zm_yunxi --ez forceVoice true" % MAIN)
