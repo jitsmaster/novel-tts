@@ -234,6 +234,14 @@ plog = logs("PreRenderer", "NovelTtsRouter")
 check("T6 pre-render renders through the same tier rules",
       "finished done=6" in plog and "failed=0" in plog,
       [l.split("PreRenderer: ")[-1] for l in plog.splitlines() if "finished" in l][:1])
+# Regression: the parameters used to be formatted as "${int - 100}%"/"${int -
+# 100}Hz", so a NEUTRAL pitch became the bare "0Hz". Edge requires a sign, the
+# server's edge-tts rejected it and every such sentence silently landed on the
+# Kokoro fallback (audio/wav instead of audio/mpeg).
+check("T6b rate/pitch reach Edge with an explicit sign (+0%/+0Hz, not 0%/0Hz)",
+      re.search(r"rate=[+-]\d+%", plog) is not None
+      and re.search(r"pitch=[+-]\d+Hz", plog) is not None,
+      [l.split("PreRenderer: ")[-1] for l in plog.splitlines() if "[pre] start" in l][:1])
 
 # --------------------------------------------- T7: settings UI card + switching
 config_only(server=GOOD, tier="server", pin=False)
